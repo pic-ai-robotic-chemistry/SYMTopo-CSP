@@ -1,0 +1,8 @@
+**/.vscode/*
+!/.vscode/settings.json
+**/__pycache__/
+/example/**
+!/example/conformers/
+!/example/conformers/conformer_tar.xyz
+!/example/refs/
+!/example/refs/WIMZEX15.cif
