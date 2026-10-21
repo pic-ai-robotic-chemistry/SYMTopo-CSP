@@ -23,6 +23,12 @@ if __name__ == "__main__":
         help="Number of worker processes",
     )
     parser.add_argument(
+        "--name", 
+        type=str, 
+        default="TEST", 
+        help="Name of the molecule (used for output files)"
+    )
+    parser.add_argument(
         "--gpu_list", nargs="+", default=default_gpu_list, help="List of GPU IDs to use"
     )
     parser.add_argument(
@@ -55,6 +61,8 @@ if __name__ == "__main__":
                 structure_path,
                 "--path",
                 args.path,
+                "--name",
+                args.name,
                 "--workers",
                 str(args.workers),
             ]

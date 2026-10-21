@@ -18,11 +18,11 @@ This repository, and especially `all_processes.py`, should be treated as a refer
 
 ## Requirements
 
-Python 3.10 or newer is required. The Python dependencies used across the workflow are:
+Python 3.10 or newer is required (3.11 is recommended). The Python dependencies used across the workflow are:
 
-- NumPy, SciPy, pandas, tqdm, NetworkX, and joblib
+- NumPy, SciPy (1.9 or newer, for `scipy.optimize.milp`), pandas, tqdm, NetworkX, and joblib
 - RDKit for conformer generation and optional aromatic-bond assignment
-- ASE for structure I/O, neighbor lists, and optimization
+- ASE (3.23 or newer, for `ase.filters.FrechetCellFilter`) for structure I/O, neighbor lists, and optimization
 - pymatgen for structure matching and deduplication
 - PyTorch and MACE (`mace-torch`) for MLIP optimization
 - `lammps_interface`, importable as `lammps_interface`, for Dreiding input generation
@@ -52,7 +52,7 @@ The conformer command accepts a SMILES string or a path to a PDB or XYZ file:
 
 ```bash
 python conformer_search.py "O=C(OCC)C1=CC=CC=C1" \
-  --out_path ./example \
+  --path ./example \
   --num_conformers 2000 \
   --rms_thresh 0.3 \
   --need_structure 10
@@ -100,7 +100,7 @@ from basic_function import format_parser, packaged_function
 molecule = format_parser.read_xyz_file("example/conformers/conformer_tar.xyz")
 packaged_function.CSP_generater_parallel(
     [molecule],
-    "example",
+    "example/structures_ori",
     need_structure=2500,
     space_group_list=[14, 2, 19, 4, 33, 9, 1, 5, 29, 7],
     max_workers=16,
@@ -108,6 +108,8 @@ packaged_function.CSP_generater_parallel(
     start_seed="auto",
 )
 ```
+
+This call only performs the packing step. It writes to the same `structures_ori/` directory that `structure_generation.py` uses; the linking, LAMMPS, and filtering steps listed above must still be run on these candidates.
 
 ### 2. Optimize with MACE
 
@@ -125,6 +127,8 @@ python optimization_mace.py \
   --gpu_list 0 1 \
   --jobs_per_gpu 4
 ```
+
+This launcher always reads the input CIF files from `<path>/structures`. 
 
 #### Option B: SLURM submission
 
@@ -166,12 +170,12 @@ python post_process.py \
 
 This command runs the following analyses in order:
 
-- `summary.py`: reads the fragment atom count, converts per-atom MACE energies to per-molecule energies, and collects densities and convergence status.
+- `summary.py`: reads the fragment atom count, converts per-atom MACE energies to per-molecule energies, and collects densities. Failed or unconverged MACE runs, and structures whose van der Waals contact network is not a single component periodic in all three directions, are written to `error.csv`; the remaining structures are ranked by energy in `result.csv`.
 - `periodicity_check.py`: records periodic directions and retains structures whose components are all periodic.
-- `duplicate_remove.py`: groups equivalent structures with pymatgen `StructureMatcher` while ignoring hydrogen atoms.
-- `fix_cifs.py` and `compare_cif.py`: run only when `example/refs` exists, then compare candidates with reference CIF files.
+- `duplicate_remove.py`: considers only structures within 10 kJ/mol of the lowest energy and groups equivalent structures with pymatgen `StructureMatcher` while ignoring hydrogen atoms. Only pairs within 5 kJ/mol and 0.2 g/cm³ of each other are compared. These thresholds are module-level constants at the top of the script.
+- `fix_cifs.py` and `compare_cif.py`: run only when `example/refs` exists, then compare the candidates in `result_validated.csv` with reference CIF files.
 
-`fix_cifs.py` rewrites CIF files inside `refs` in place through ASE. Keep a copy of reference files if their original formatting or metadata must be preserved.
+`fix_cifs.py` rewrites CIF files inside `refs` in place through ASE, including the bundled `example/refs/WIMZEX15.cif`. Keep a copy of reference files if their original formatting or metadata must be preserved.
 
 ## Reference convenience driver
 
@@ -186,6 +190,7 @@ After preparing `conformer_tar.xyz`, omit `--smiles` to run structure generation
 ```bash
 python all_processes.py \
   --path ./example \
+  --name TEST \
   --workers 16 \
   --gpu_list 0 1 \
   --jobs_per_gpu 4
@@ -209,10 +214,13 @@ example/
 ├── cif_result_final/           final MACE-optimized CIF files
 ├── json_result/                per-structure MACE summaries
 ├── result.csv                  collected successful structures
+├── error.csv                   failed, unconverged, or disconnected structures
 ├── periodicity_summary.csv     periodicity diagnostics
 ├── result_validated.csv        periodic structures
-└── result_deduplicated.csv     unique structures
+└── result_deduplicated.csv     unique structures within 10 kJ/mol of the minimum
 ```
+
+SLURM submissions also write job logs to `logs/` by default. The `lock/` directory is used during MACE optimization and is removed once every input structure has a result.
 
 If `refs/` is present, postprocessing also writes `result_matched_to_refs.csv` and, when needed, `result_match_to_refs_errors.csv`.
 
