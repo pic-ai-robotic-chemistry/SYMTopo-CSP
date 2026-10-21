@@ -82,6 +82,16 @@ done
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SLURM_SCRIPT="$SCRIPT_DIR/slurm.sh"
+PYTHON_SCRIPT="$SCRIPT_DIR/mace_opt_slurm.py"
+
+if [[ ! -f "$SLURM_SCRIPT" ]]; then
+    echo "Error: SLURM script does not exist: $SLURM_SCRIPT" >&2
+    exit 2
+fi
+if [[ ! -f "$PYTHON_SCRIPT" ]]; then
+    echo "Error: Python script does not exist: $PYTHON_SCRIPT" >&2
+    exit 2
+fi
 
 for VALUE_NAME in GPU_COUNT TASKS_PER_NODE; do
     VALUE="${!VALUE_NAME}"
@@ -118,13 +128,14 @@ echo "Target CIF folder : $TARGET_CIF_DIR"
 echo "Log directory     : $LOG_DIR"
 echo "GPU count         : $GPU_COUNT"
 echo "Workers per job   : $TASKS_PER_NODE"
+echo "Python script     : $PYTHON_SCRIPT"
 
 for ((i = 1; i <= GPU_COUNT; i++)); do
     CURRENT_JOB_NAME="${JOB_NAME_BASE}_${i}"
     echo "Submitting job $i/$GPU_COUNT: name=$CURRENT_JOB_NAME, workers=$TASKS_PER_NODE"
 
     # Command-line options override the corresponding defaults in slurm.sh.
-    # The three trailing values become positional arguments inside slurm.sh.
+    # The four trailing values become positional arguments inside slurm.sh.
     sbatch \
         -J "$CURRENT_JOB_NAME" \
         --ntasks-per-node="$TASKS_PER_NODE" \
@@ -133,7 +144,8 @@ for ((i = 1; i <= GPU_COUNT; i++)); do
         "$SLURM_SCRIPT" \
         "$TASKS_PER_NODE" \
         "$TARGET_PATH" \
-        "$TARGET_CIF_DIR"
+        "$TARGET_CIF_DIR" \
+        "$PYTHON_SCRIPT"
 done
 
 echo "All jobs were submitted successfully."

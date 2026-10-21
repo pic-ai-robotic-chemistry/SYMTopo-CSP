@@ -24,7 +24,7 @@ def process_crystal(
     if new_crystal is not None:
         cif_out = format_parser.write_cif_file(new_crystal)
         with open(
-            f"{output_path}/structures_ori/{add_name}_{sg}_{seed}_z{len(molecules)}.cif",
+            f"{output_path}/{add_name}_{sg}_z{len(molecules)}_{seed}.cif",
             "w",
         ) as target:
             target.writelines(cif_out)
@@ -53,7 +53,7 @@ def CSP_generater_parallel(
         raise ValueError(
             "Length of space_group_list and need_structure must be the same"
         )
-    tar_folder = "{}/structures_ori".format(output_path)
+    tar_folder = output_path
     os.makedirs(tar_folder, exist_ok=True)
 
     existing_files = [
@@ -66,7 +66,7 @@ def CSP_generater_parallel(
         accept = 0
         if start_seed == "auto" and len(existing_files) > 0:
             pattern = (
-                rf"{re.escape(add_name)}_{sg}_(?P<seed>-?\d+)_z{len(molecules)}\.cif"
+                rf"{re.escape(add_name)}_{sg}_z{len(molecules)}_(?P<seed>-?\d+)\.cif"
             )
             seed = (
                 max(

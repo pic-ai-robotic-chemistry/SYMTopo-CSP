@@ -46,7 +46,7 @@ if __name__ == "__main__":
 
     if args.smiles != "":
         subprocess.run(
-            [sys.executable, conformer_path, args.smiles, "--out_path", args.path]
+            [sys.executable, conformer_path, args.smiles, "--path", args.path]
         )
     else:
         subprocess.run(

@@ -24,6 +24,11 @@ if __name__ == "__main__":
         default=default_workers,
         help="Number of worker processes",
     )
+    parser.add_argument(
+        "--generate_only", 
+        action="store_true", 
+        help="Only generate structures without linking and LAMMPS processing"
+    )
     args = parser.parse_args()
 
     name = args.name
@@ -40,15 +45,22 @@ if __name__ == "__main__":
     bad_path = path / "bad_structures"
 
     molecule = format_parser.read_xyz_file(conformer_file)
+
+    if args.generate_only:
+        ori_path = output_path
     packaged_function.CSP_generater_parallel(
         [molecule],
-        path,
+        ori_path,
         need_structure=25,
         space_group_list=[14, 2, 19, 4, 33, 9, 1, 5, 29, 7],
         add_name=name,
         max_workers=workers,
         start_seed="auto",
     )
+    if args.generate_only:
+        print("Structure generation completed. Exiting as --generate_only flag is set.")
+        sys.exit(0)
+
     link_structures(ori_path, linked_path, max_workers=workers, scale_factor=1.0)
 
     to_lammps_path = script_path / "to_lammps_data.py"

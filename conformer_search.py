@@ -10,7 +10,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("smiles", type=str, help="SMILES string of the molecule")
     parser.add_argument(
-        "--out_path", type=str, default="./example", help="Output path for conformers"
+        "--path", type=str, default="./example", help="Output path for conformers"
     )
     parser.add_argument(
         "--num_conformers",
@@ -37,7 +37,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     conformer_search(
         args.smiles,
-        out_path=args.out_path,
+        out_path=args.path,
         num_conformers=args.num_conformers,
         rms_thresh=args.rms_thresh,
         with_opt=args.with_opt,

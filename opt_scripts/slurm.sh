@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -o job.%j.out
 #SBATCH -e job-%j.err
-#SBATCH -p a800
+#SBATCH -p normal
 #SBATCH -J mace_opt
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -11,17 +11,22 @@
 
 set -eo pipefail
 
-if [[ $# -lt 1 || $# -gt 3 ]]; then
-    echo "Usage: $0 N_JOBS [TARGET_PATH] [TARGET_FOLDER]" >&2
+if [[ $# -ne 4 ]]; then
+    echo "Usage: $0 N_JOBS TARGET_PATH TARGET_FOLDER PYTHON_SCRIPT" >&2
     exit 2
 fi
 
 N_JOBS="$1"
-TARGET_PATH="${2:-.}"
-TARGET_FOLDER="${3:-structures}"
+TARGET_PATH="$2"
+TARGET_FOLDER="$3"
+PYTHON_SCRIPT="$4"
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_EXECUTABLE="${PYTHON_EXECUTABLE:-python}"
+
+if [[ ! -f "$PYTHON_SCRIPT" ]]; then
+    echo "Error: Python script does not exist: $PYTHON_SCRIPT" >&2
+    exit 2
+fi
 
 if [[ ! -d "$TARGET_PATH" ]]; then
     echo "Error: target path does not exist: $TARGET_PATH" >&2
@@ -73,9 +78,10 @@ echo "---------------------------------------------------------"
 echo "Parallel workers             : $N_JOBS"
 echo "Target path                  : $TARGET_PATH"
 echo "Target CIF folder            : $TARGET_CIF_DIR"
+echo "Python script                : $PYTHON_SCRIPT"
 echo
 
-"$PYTHON_EXECUTABLE" "$SCRIPT_DIR/mace_opt_slurm.py" \
+"$PYTHON_EXECUTABLE" "$PYTHON_SCRIPT" \
     --path "$TARGET_PATH" \
     --target_folder "$TARGET_CIF_DIR" \
     --n_jobs "$N_JOBS"
