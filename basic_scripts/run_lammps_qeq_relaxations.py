@@ -14,7 +14,29 @@ Workflow per job directory:
    - performs fixed-cell atomic relaxation with QEq active
    - performs a final atom + cell box/relax cycle with QEq active
    - writes final.data and an optional lammpstrj trajectory
-5. Run LAMMPS through subprocess in parallel across job directories
+5. Run LAMMPS in parallel across job directories
+
+LAMMPS runs in long-lived worker processes through its Python module (--runner
+library, the default): starting LAMMPS once per worker instead of once per job
+removes most of the per-job launch cost. --runner subprocess launches --lmp-cmd
+for every job as before.
+
+Supercell jobs written by to_lammps_data.py (replication other than 1x1x1) are
+relaxed under the lattice translations of the original unit cell: the copies are
+first placed exactly on those translations, and at every force evaluation a fix
+external callback replaces the force on each copy by the mean force over all
+copies of the same unit-cell atom. The supercell then stays translation
+symmetric up to round-off, so export_lammps_results_to_cif.py can take copy 0 as
+the relaxed unit cell. This needs --runner library and runs LAMMPS serially.
+
+After a job finishes, its relaxed bonds are compared with the intended ones
+(the check export_lammps_results_to_cif.py applies). If they differ, the job is
+run once more with --retry-fire-steps steps of FIRE appended to stage 1. The
+line-search minimizers can stall in strained states, because the Dreiding
+umbrella improper in LAMMPS changes its energy discontinuously when the
+out-of-plane atom crosses to the side of its two neighbours; FIRE follows the
+forces only and gets past it. The first attempt's outputs are kept with an
+.attempt1 suffix. If the retry itself fails, the first attempt is restored.
 
 The script is intentionally conservative at the force-field level, but its
 default optimization recipe is tuned for coarse pre-DFT cleanup:
@@ -69,13 +91,18 @@ import subprocess
 import sys
 import time
 import traceback
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
 from tqdm import tqdm
 
-SCRIPT_VERSION = "1.2.7"
+SCRIPT_VERSION = "1.4.0"
+RUNNING_MARKER = "relax.running"
+# Topology results that trigger the FIRE retry (see check_topology).
+RETRY_TOPOLOGIES = {"mismatch", "asymmetric"}
 
 
 @dataclass
@@ -85,6 +112,9 @@ class JobResult:
     status: str
     message: str
     duration_sec: float
+    replication: str = ""
+    symmetry_spread_max: str = ""
+    fire_retry: str = ""
     metadata_file: str = ""
     input_file: str = ""
     data_file: str = ""
@@ -189,9 +219,28 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--runner",
+        choices=["library", "subprocess"],
+        default="library",
+        help=(
+            "library: run LAMMPS through its Python module in long-lived workers "
+            "(default; required for supercell symmetrization); subprocess: launch "
+            "--lmp-cmd for every job"
+        ),
+    )
+    parser.add_argument(
+        "--symmetrize",
+        choices=["on", "off"],
+        default="on",
+        help=(
+            "Keep supercell jobs symmetric under the unit-cell translations "
+            "(default: on; off is for testing only)"
+        ),
+    )
+    parser.add_argument(
         "--lmp-cmd",
         default="lmp",
-        help="LAMMPS launch command, including arguments such as 'mpirun -np 4 lmp'",
+        help="LAMMPS launch command for --runner subprocess, e.g. 'mpirun -np 4 lmp'",
     )
 
     parser.add_argument(
@@ -314,6 +363,24 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--pre-maxeval", type=int, default=10000, help="Stage-one minimize maxeval"
     )
+    parser.add_argument(
+        "--retry-fire-steps",
+        type=int,
+        default=2000,
+        help=(
+            "Rerun jobs whose relaxed bonds differ from the intended ones with this "
+            "many FIRE steps appended to stage 1 (default: 2000; 0 disables the retry)"
+        ),
+    )
+    parser.add_argument(
+        "--retry-mult",
+        type=float,
+        default=1.2,
+        help=(
+            "Covalent-radius multiplier of the topology check that triggers the "
+            "retry, as in export_lammps_results_to_cif.py (default: 1.2)"
+        ),
+    )
 
     parser.add_argument(
         "--box-mode",
@@ -415,6 +482,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         parser.error("--box-cycles must not be negative")
     if args.dump_every < 0:
         parser.error("--dump-every must not be negative")
+    if args.retry_fire_steps < 0:
+        parser.error("--retry-fire-steps must not be negative")
     return args
 
 
@@ -678,7 +747,9 @@ def build_optimize_input(
     qeq_file_name: str,
     enable_kspace: bool,
     has_kspace_style: bool,
+    fire_steps: int = 0,
 ) -> str:
+    """Build in.optimize; fire_steps > 0 appends that many FIRE steps to stage 1."""
     use_qeq = args.use_qeq == "on"
     qeq_cmd = build_qeq_fix_command(args, qeq_file_name) if use_qeq else ""
     box_cmd = build_box_relax_command(args)
@@ -690,14 +761,26 @@ def build_optimize_input(
         )
 
     summary = args.summary_name
-    pre_block = ""
+    stage1_lines = ""
     if args.pre_relax == "on":
-        pre_block = (
-            "# Stage 1: fixed-cell atomic relaxation; QEq is already active when enabled.\n"
-            f'print "phase=pre_relax_start" append {summary}\n'
+        stage1_lines = (
             f"min_style {args.pre_min_style}\n"
             f"min_modify dmax {float(args.pre_dmax):.16g} line {args.pre_line}\n"
             f"minimize {float(args.pre_etol):.16g} {float(args.pre_ftol):.16g} {int(args.pre_maxiter)} {int(args.pre_maxeval)}\n"
+        )
+    if fire_steps > 0:
+        stage1_lines += (
+            "# Topology retry: FIRE moves along the forces without a line search,\n"
+            "# so it gets past the energy jumps the umbrella improper can produce.\n"
+            "min_style fire\n"
+            f"minimize 0.0 {float(args.pre_ftol):.16g} {int(fire_steps)} {10 * int(fire_steps)}\n"
+        )
+    pre_block = ""
+    if stage1_lines:
+        pre_block = (
+            "# Stage 1: fixed-cell atomic relaxation; QEq is already active when enabled.\n"
+            f'print "phase=pre_relax_start" append {summary}\n'
+            f"{stage1_lines}"
             f'print "phase=pre_relax_done step=${{stepv}} pe=${{pev}} press=${{pressv}} vol=${{volv}} qsum=${{qsumv}}" append {summary}\n\n'
         )
 
@@ -822,11 +905,216 @@ def build_lammps_command(
     return cmd
 
 
+def check_topology(job_dir: Path, final_data: Path, mult: float) -> str:
+    """Topology of a relaxed job as export_lammps_results_to_cif.py reports it."""
+    from export_lammps_results_to_cif import check_job
+
+    report, _ = check_job(job_dir, final_data, mult)
+    return str(report["topology"])
+
+
+def rename_outputs(paths: Iterable[Path], suffix: str, restore: bool = False) -> None:
+    """Move each existing path to path+suffix, or back with restore=True."""
+    for path in paths:
+        src, dst = Path(str(path) + suffix), path
+        if not restore:
+            src, dst = dst, src
+        if src.exists():
+            if dst.exists():
+                dst.unlink()
+            src.rename(dst)
+
+
 def write_status(job_dir: Path, payload: Dict[str, Any]) -> None:
     write_json(job_dir / "relax.status.json", payload)
 
 
+_LAMMPS_MODULE = None
+
+
+def lammps_module():
+    """Import the LAMMPS Python module once per worker process."""
+    global _LAMMPS_MODULE
+    if _LAMMPS_MODULE is None:
+        import lammps  # type: ignore
+
+        _LAMMPS_MODULE = lammps
+    return _LAMMPS_MODULE
+
+
+def supercell_map(metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Per LAMMPS atom ID: unit-cell atom and copy, for supercell jobs; else None."""
+    rep = metadata.get("bond_images", {}).get("replication", [1, 1, 1])
+    if list(rep) == [1, 1, 1]:
+        return None
+    atoms = metadata["atoms"]
+    if any("unit_cell_atom" not in a for a in atoms):
+        raise ValueError(
+            "Supercell job without unit_cell_atom/copy in metadata.json; "
+            "regenerate it with the current to_lammps_data.py"
+        )
+    max_tag = max(int(a["atom_id"]) for a in atoms)
+    prim = np.full(max_tag + 1, -1, dtype=np.int64)
+    copy = np.zeros((max_tag + 1, 3), dtype=np.int64)
+    for a in atoms:
+        tag = int(a["atom_id"])
+        prim[tag] = int(a["unit_cell_atom"])
+        copy[tag] = a["copy"]
+    n_prim = int(prim.max()) + 1
+    counts = np.bincount(prim[prim >= 0], minlength=n_prim)
+    if np.any(counts != int(np.prod(rep))):
+        raise ValueError("Every unit-cell atom must have exactly one atom per copy")
+    return {"rep": np.asarray(rep, dtype=np.int64), "prim": prim, "copy": copy,
+            "n_prim": n_prim, "counts": counts.astype(float)}
+
+
+def box_matrix(lmp) -> Tuple[np.ndarray, np.ndarray]:
+    """Box origin and the matrix whose rows are the LAMMPS box vectors a, b, c."""
+    boxlo, boxhi, xy, yz, xz, _periodicity, _box_change = lmp.extract_box()
+    h = np.array(
+        [
+            [boxhi[0] - boxlo[0], 0.0, 0.0],
+            [xy, boxhi[1] - boxlo[1], 0.0],
+            [xz, yz, boxhi[2] - boxlo[2]],
+        ]
+    )
+    return np.asarray(boxlo, dtype=float), h
+
+
+def symmetry_offsets(lmp, smap: Dict[str, Any]) -> np.ndarray:
+    """Displacement of each local atom from copy 0 shifted by its unit-cell translation.
+
+    Returns an (nlocal, 3) array in local-atom order. Whole supercell vectors are
+    removed, so wrapping into the box does not count as a deviation.
+    """
+    nlocal = lmp.extract_global("nlocal")
+    tags = np.asarray(lmp.numpy.extract_atom("id")).reshape(-1)[:nlocal]
+    x = np.asarray(lmp.numpy.extract_atom("x"))[:nlocal]
+    boxlo, h = box_matrix(lmp)
+    lam = (x - boxlo) @ np.linalg.inv(h)
+    prim, copy, rep = smap["prim"][tags], smap["copy"][tags], smap["rep"]
+    base = np.full(smap["n_prim"], -1, dtype=np.int64)
+    first = np.all(copy == 0, axis=1)
+    base[prim[first]] = np.flatnonzero(first)
+    if np.any(base < 0):
+        raise ValueError("A unit-cell atom has no copy 0")
+    target = lam[base[prim]] + copy / rep
+    dlam = target - lam
+    dlam -= np.rint(dlam)
+    return dlam @ h
+
+
+def symmetrize_positions(lmp, smap: Dict[str, Any]) -> float:
+    """Move every copy onto copy 0 plus its unit-cell translation; return the max move."""
+    nlocal = lmp.extract_global("nlocal")
+    shift = symmetry_offsets(lmp, smap)
+    moved = float(np.linalg.norm(shift, axis=1).max())
+    if moved > 1.0e-3:
+        raise ValueError(
+            f"Copies deviate by {moved:.3g} A from the unit-cell translations; "
+            "the supercell does not match its metadata"
+        )
+    x = lmp.numpy.extract_atom("x")
+    x[:nlocal] += shift
+    return moved
+
+
+def make_force_symmetrizer(lmp, smap: Dict[str, Any], stats: Dict[str, float]):
+    """fix external callback: give every copy the mean force of its unit-cell atom.
+
+    The callback runs after all force terms are summed (post_force). fexternal is
+    set to mean - f, which LAMMPS then adds to f. It contributes no energy and
+    no virial, so pressure and potential energy are unchanged.
+    """
+    prim_of_tag, counts, n_prim = smap["prim"], smap["counts"], smap["n_prim"]
+
+    def callback(_caller, _step, nlocal, tag, _x, fext):
+        prim = prim_of_tag[np.asarray(tag).reshape(-1)[:nlocal]]
+        f = np.asarray(lmp.numpy.extract_atom("f"))[:nlocal]
+        mean = np.empty((n_prim, 3))
+        for k in range(3):
+            mean[:, k] = np.bincount(prim, weights=f[:, k], minlength=n_prim) / counts
+        correction = mean[prim] - f
+        fext[:nlocal] = correction
+        stats["max_force_correction"] = max(
+            stats["max_force_correction"], float(np.abs(correction).max())
+        )
+
+    return callback
+
+
+def run_job_in_process(
+    job_dir: Path,
+    optimize_text: str,
+    log_name: str,
+    smap: Optional[Dict[str, Any]],
+    timeout: Optional[int],
+) -> Tuple[int, bool, Dict[str, Any], str, str]:
+    """Run in.optimize through the LAMMPS Python module in this worker process.
+
+    Returns (returncode, timed_out, info, stdout_text, stderr_text).
+    """
+    lammps = lammps_module()
+    lines = optimize_text.splitlines()
+    split = next(k for k, line in enumerate(lines) if line.startswith("include ")) + 1
+    head, tail = "\n".join(lines[:split]), "\n".join(lines[split:])
+    info: Dict[str, Any] = {}
+    stdout, stderr, returncode = [], "", 0
+    previous_cwd = os.getcwd()
+    lmp = None
+    try:
+        os.chdir(job_dir)
+        lmp = lammps.lammps(cmdargs=["-log", log_name, "-screen", "none", "-nocite"])
+        stdout.append(f"LAMMPS {lmp.version()} through the Python module")
+        if timeout:
+            lmp.command(f"timer timeout {int(timeout)} every 10")
+        lmp.commands_string(head)
+        if smap is not None:
+            info["initial_symmetry_move"] = symmetrize_positions(lmp, smap)
+            stats = {"max_force_correction": 0.0}
+            lmp.command("fix symtrans all external pf/callback 1 1")
+            lmp.set_fix_external_callback("symtrans", make_force_symmetrizer(lmp, smap, stats))
+            stdout.append(
+                f"translation symmetry enforced over {int(np.prod(smap['rep']))} copies"
+            )
+        lmp.commands_string(tail)
+        if smap is not None:
+            info["max_force_correction"] = stats["max_force_correction"]
+            offsets = symmetry_offsets(lmp, smap)
+            info["symmetry_spread_max"] = float(np.linalg.norm(offsets, axis=1).max())
+    except Exception:  # noqa: BLE001
+        returncode = 1
+        stderr = traceback.format_exc()
+    finally:
+        if lmp is not None:
+            lmp.close()
+        os.chdir(previous_cwd)
+    log_path = job_dir / log_name
+    timed_out = log_path.is_file() and "walltime limit reached" in log_path.read_text(
+        encoding="utf-8", errors="replace"
+    )
+    return returncode, timed_out, info, "\n".join(stdout) + "\n", stderr
+
+
 def run_single_job(
+    job_dir_str: str, args_dict: Dict[str, Any], qeq_cfg: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Run one job; a marker file shows which jobs were running if a worker dies."""
+    marker = Path(job_dir_str) / RUNNING_MARKER
+    try:
+        marker.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        return _run_single_job(job_dir_str, args_dict, qeq_cfg)
+    finally:
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+
+
+def _run_single_job(
     job_dir_str: str, args_dict: Dict[str, Any], qeq_cfg: Dict[str, Any]
 ) -> Dict[str, Any]:
     args = argparse.Namespace(**args_dict)
@@ -937,37 +1225,132 @@ def run_single_job(
         base_text = sanitize_original_input_text(prepared_text)
         ensure_file_text(base_include_file, base_text)
 
-        optimize_text = build_optimize_input(
-            args,
-            metadata,
-            base_include_file.name,
-            qeq_file.name,
-            enable_kspace,
-            has_kspace_style,
+        smap = supercell_map(metadata) if args.symmetrize == "on" else None
+        replication = "x".join(
+            str(v) for v in metadata.get("bond_images", {}).get("replication", [1, 1, 1])
         )
-        ensure_file_text(optimize_input_file, optimize_text)
-
-        lmp_cmd = build_lammps_command(args, optimize_input_file.name, log_file.name)
-        with launcher_stdout.open("w", encoding="utf-8") as out, launcher_stderr.open(
-            "w", encoding="utf-8"
-        ) as err:
-            proc = subprocess.run(
-                lmp_cmd,
-                cwd=job_dir,
-                stdout=out,
-                stderr=err,
-                timeout=args.timeout,
-                check=False,
+        if smap is not None and args.runner != "library":
+            raise ValueError(
+                "Supercell jobs need --runner library to keep the translation symmetry"
             )
 
+        def write_optimize_input(fire_steps: int) -> str:
+            text = build_optimize_input(
+                args,
+                metadata,
+                base_include_file.name,
+                qeq_file.name,
+                enable_kspace,
+                has_kspace_style,
+                fire_steps,
+            )
+            if smap is not None:
+                ensure_file_text(
+                    optimize_input_file,
+                    text.replace(
+                        "\ninclude ",
+                        "\n# Supercell job: run_lammps_qeq_relaxations.py adds, right after the\n"
+                        "# include below, a fix external callback that keeps the copies\n"
+                        "# symmetric. This file alone does not reproduce that run.\n"
+                        "include ",
+                        1,
+                    ),
+                )
+            else:
+                ensure_file_text(optimize_input_file, text)
+            return text
+
+        def run_lammps(text: str) -> Tuple[int, Dict[str, Any]]:
+            """Run one attempt; returns (returncode, symmetry info)."""
+            if args.runner == "library":
+                rc, timed_out, info, out_text, err_text = run_job_in_process(
+                    job_dir, text, log_file.name, smap, args.timeout
+                )
+                launcher_stdout.write_text(out_text, encoding="utf-8")
+                launcher_stderr.write_text(err_text, encoding="utf-8")
+                if timed_out:
+                    raise subprocess.TimeoutExpired("lammps", args.timeout)
+                return rc, info
+            lmp_cmd = build_lammps_command(args, optimize_input_file.name, log_file.name)
+            with launcher_stdout.open("w", encoding="utf-8") as out, launcher_stderr.open(
+                "w", encoding="utf-8"
+            ) as err:
+                proc = subprocess.run(
+                    lmp_cmd,
+                    cwd=job_dir,
+                    stdout=out,
+                    stderr=err,
+                    timeout=args.timeout,
+                    check=False,
+                )
+            return proc.returncode, {}
+
+        # Files one attempt writes; a retry keeps the first attempt's as *.attempt1.
+        attempt_files = [
+            optimize_input_file,
+            log_file,
+            summary_file,
+            final_data_file,
+            final_dump_file,
+            launcher_stdout,
+            launcher_stderr,
+        ]
+        for path in attempt_files:
+            for suffix in (".attempt1", ".retry"):
+                Path(str(path) + suffix).unlink(missing_ok=True)
+
+        optimize_text = write_optimize_input(0)
+        returncode, sym_info = run_lammps(optimize_text)
+
+        retry: Dict[str, Any] = {
+            "enabled": args.retry_fire_steps > 0,
+            "fire_steps": args.retry_fire_steps,
+            "mult": args.retry_mult,
+        }
+        if args.retry_fire_steps > 0 and returncode == 0 and final_data_file.exists():
+            try:
+                retry["first_topology"] = check_topology(
+                    job_dir, final_data_file, args.retry_mult
+                )
+            except Exception as exc:  # noqa: BLE001
+                retry["first_topology"] = "check_error"
+                retry["check_error"] = str(exc)
+            if retry["first_topology"] in RETRY_TOPOLOGIES:
+                rename_outputs(attempt_files, ".attempt1")
+                retry_text = write_optimize_input(args.retry_fire_steps)
+                try:
+                    retry_rc, retry_info = run_lammps(retry_text)
+                except subprocess.TimeoutExpired:
+                    retry_rc, retry_info = None, {}
+                    retry["timed_out"] = True
+                retry["returncode"] = retry_rc
+                if retry_rc == 0 and final_data_file.exists():
+                    sym_info = retry_info
+                    try:
+                        retry["topology"] = check_topology(
+                            job_dir, final_data_file, args.retry_mult
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        retry["topology"] = "check_error"
+                        retry["check_error"] = str(exc)
+                else:
+                    # Keep the first attempt; the failed retry's files get *.retry.
+                    rename_outputs(attempt_files, ".retry")
+                    rename_outputs(attempt_files, ".attempt1", restore=True)
+                    retry["topology"] = "failed"
+
         summary_parsed = parse_summary_file(summary_file)
-        ok = proc.returncode == 0 and final_data_file.exists()
+        ok = returncode == 0 and final_data_file.exists()
         status = "success" if ok else "failed"
         message = (
             "Optimization completed"
             if ok
-            else f"LAMMPS returned nonzero exit code: {proc.returncode}"
+            else f"LAMMPS returned nonzero exit code: {returncode}"
         )
+        if "topology" in retry:
+            message += (
+                f"; FIRE retry after topology {retry['first_topology']}: {retry['topology']}"
+            )
 
         status_payload = {
             "script_version": SCRIPT_VERSION,
@@ -976,7 +1359,13 @@ def run_single_job(
             "job_name": job_name,
             "job_dir": str(job_dir),
             "duration_sec": time.time() - start,
-            "returncode": proc.returncode,
+            "returncode": returncode,
+            "runner": args.runner,
+            "replication": replication,
+            "translation_symmetry": (
+                {"enforced": True, **sym_info} if smap is not None else {"enforced": False}
+            ),
+            "topology_retry": retry,
             "metadata_file": str(metadata_file),
             "input_file": str(input_path),
             "data_file": str(data_path),
@@ -1052,6 +1441,13 @@ def run_single_job(
                 status=status,
                 message=message,
                 duration_sec=time.time() - start,
+                replication=replication,
+                symmetry_spread_max=(
+                    f"{sym_info['symmetry_spread_max']:.3e}"
+                    if "symmetry_spread_max" in sym_info
+                    else ""
+                ),
+                fire_retry=retry.get("topology", ""),
                 metadata_file=str(metadata_file),
                 input_file=str(input_path),
                 data_file=str(data_path),
@@ -1127,6 +1523,9 @@ def write_manifest(jobs_root: Path, results: Iterable[Dict[str, Any]]) -> Path:
         "status",
         "message",
         "duration_sec",
+        "replication",
+        "symmetry_spread_max",
+        "fire_retry",
         "metadata_file",
         "input_file",
         "data_file",
@@ -1149,6 +1548,10 @@ def write_manifest(jobs_root: Path, results: Iterable[Dict[str, Any]]) -> Path:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    # Open MPI binds every singleton LAMMPS process (one started without
+    # mpirun) to CPU 0, so parallel jobs would all share one core. Unless the
+    # user chose a binding policy, let the operating system place them.
+    os.environ.setdefault("OMPI_MCA_hwloc_base_binding_policy", "none")
     if args.use_qeq == "on":
         qeq_cfg = load_qeq_config(args.qeq_json.resolve())
     else:
@@ -1161,34 +1564,66 @@ def main(argv: Optional[List[str]] = None) -> int:
     workers = default_workers(args.processes)
     results: List[Dict[str, Any]] = []
     args_dict = vars(args).copy()
-    args_dict["jobs_root"] = str(args.jobs_root)
-    args_dict["qeq_json"] = str(args.qeq_json) if args.qeq_json is not None else None
+    # Library workers change directory per job, so pass absolute paths.
+    args_dict["jobs_root"] = str(args.jobs_root.resolve())
+    args_dict["qeq_json"] = (
+        str(args.qeq_json.resolve()) if args.qeq_json is not None else None
+    )
 
-    with cf.ProcessPoolExecutor(max_workers=workers) as ex:
-        futures = {
-            ex.submit(run_single_job, str(job_dir), args_dict, qeq_cfg): job_dir
-            for job_dir in job_dirs
-        }
-        for fut in tqdm(
-            cf.as_completed(futures),
-            total=len(futures),
-            desc="Running LAMMPS relaxations",
-            unit="structure",
-        ):
-            job_dir = futures[fut]
-            try:
-                result = fut.result()
-            except Exception as exc:
-                result = asdict(
-                    JobResult(
-                        job_name=job_dir.name,
-                        job_dir=str(job_dir),
-                        status="failed",
-                        message=f"Worker failed: {exc}",
-                        duration_sec=0.0,
+    def failed(job_dir: Path, message: str) -> Dict[str, Any]:
+        return asdict(
+            JobResult(
+                job_name=job_dir.name,
+                job_dir=str(job_dir),
+                status="failed",
+                message=message,
+                duration_sec=0.0,
+            )
+        )
+
+    def run_batch(dirs: List[Path], n_workers: int, progress) -> List[Path]:
+        """Run dirs in a pool; return the jobs left unfinished by a dead worker."""
+        unfinished: List[Path] = []
+        with cf.ProcessPoolExecutor(max_workers=n_workers) as ex:
+            futures = {
+                ex.submit(run_single_job, str(job_dir), args_dict, qeq_cfg): job_dir
+                for job_dir in dirs
+            }
+            for fut in cf.as_completed(futures):
+                job_dir = futures[fut]
+                try:
+                    results.append(fut.result())
+                    progress.update(1)
+                except BrokenProcessPool:
+                    unfinished.append(job_dir)
+                except Exception as exc:
+                    results.append(failed(job_dir, f"Worker failed: {exc}"))
+                    progress.update(1)
+        return unfinished
+
+    # A crashing LAMMPS run kills its worker and breaks the whole pool. Jobs that
+    # were running at that moment (marker file present) are retried one at a
+    # time; a job that crashes again on its own is reported as failed.
+    with tqdm(total=len(job_dirs), desc="Running LAMMPS relaxations", unit="structure") as bar:
+        pending = run_batch(job_dirs, workers, bar)
+        while pending:
+            suspects = [d for d in pending if (d / RUNNING_MARKER).exists()]
+            others = [d for d in pending if d not in suspects]
+            for job_dir in suspects:
+                if run_batch([job_dir], 1, bar):
+                    (job_dir / RUNNING_MARKER).unlink(missing_ok=True)
+                    write_status(
+                        job_dir,
+                        {
+                            "script_version": SCRIPT_VERSION,
+                            "status": "failed",
+                            "message": "LAMMPS crashed the worker process twice",
+                            "job_dir": str(job_dir),
+                        },
                     )
-                )
-            results.append(result)
+                    results.append(failed(job_dir, "LAMMPS crashed the worker process twice"))
+                    bar.update(1)
+            pending = run_batch(others, workers, bar) if others else []
 
     manifest = write_manifest(args.jobs_root.resolve(), results)
     n_success = sum(r["status"] == "success" for r in results)
@@ -1196,6 +1631,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     n_skipped = sum(r["status"] == "skipped" for r in results)
 
     print(f"\nCompleted: success={n_success}, failed={n_failed}, skipped={n_skipped}")
+    retried = [r.get("fire_retry", "") for r in results if r.get("fire_retry", "")]
+    if retried:
+        print(
+            f"FIRE topology retries: {len(retried)}, "
+            f"topology ok after retry: {sum(t == 'ok' for t in retried)}"
+        )
     print(f"manifest: {manifest}")
     return 0 if n_failed == 0 else 1
 

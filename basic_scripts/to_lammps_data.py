@@ -3,10 +3,19 @@
 Batch-convert CIF files into LAMMPS input/data files with lammps-interface,
 while forcing framework-only handling:
 - disable molecule/guest splitting
-- force replication = 1x1x1
+- disable lammps-interface's own replication and orthogonalization
+
+LAMMPS resolves every bonded partner to its closest periodic image and ignores
+the image recorded in the CIF bond loop. When a linked CIF has a bond, or a
+two-bond walk of an angle/dihedral/improper, whose intended image is not the
+closest one, the structure is first written as the smallest a x b x c supercell
+in which it is (see supercell_utils.py). run_lammps_qeq_relaxations.py relaxes
+such a supercell under the unit-cell translations, and
+export_lammps_results_to_cif.py takes its copy 0 as the relaxed unit cell.
 
 The script creates one job directory per CIF and writes:
 - source.cif
+- supercell.cif (only when a supercell is needed)
 - data.<name>
 - in.<name>
 - metadata.json
@@ -35,9 +44,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional
 
+import numpy as np
 from tqdm import tqdm
 
-SCRIPT_VERSION = "1.0.0"
+from supercell_utils import choose_replication, read_bonded_cif, write_supercell_cif
+
+SCRIPT_VERSION = "1.1.0"
 
 
 @dataclass
@@ -48,6 +60,7 @@ class JobResult:
     status: str
     message: str
     duration_sec: float
+    replication: str = ""
     atom_count: int = 0
     bond_count: int = 0
     angle_count: int = 0
@@ -208,7 +221,11 @@ def make_framework_only_simulation_class(LammpsSimulation):
             return None
 
         def compute_simulation_size(self):  # type: ignore[override]
-            """Force replication to 1x1x1 and disable orthogonalization."""
+            """Force replication to 1x1x1 and disable orthogonalization.
+
+            Orthogonalization must stay off: redefine_lattice() would recompute
+            every bond image by minimum image and discard the CIF bond images.
+            """
             self.options.replication = "1x1x1"
             self.options.orthogonalize = False
             super().compute_simulation_size()
@@ -307,9 +324,124 @@ def collect_bond_summary(graph: Any) -> Dict[str, Any]:
     }
 
 
+def plan_bond_images(
+    cif_path: Path, job_dir: Path, args: argparse.Namespace
+) -> Dict[str, Any]:
+    """Choose the replication that makes every intended bond image the closest one.
+
+    Returns the bond_images metadata block and, under "lammps_cif", the CIF that
+    lammps-interface should read (the source CIF itself when 1x1x1 suffices).
+    """
+    info: Dict[str, Any] = {
+        "policy": args.supercell,
+        "required_margin": float(args.image_margin),
+        "replication": [1, 1, 1],
+        "lammps_cif": cif_path,
+    }
+    if args.supercell == "off":
+        return info
+    cif = read_bonded_cif(cif_path)
+    if not cif.bonds:
+        info["note"] = "no bond loop; lammps-interface computes bonds by minimum image"
+        return info
+    rep, margin_1x1x1, margin = choose_replication(
+        cif, threshold=args.image_margin, max_rep=args.max_replication
+    )
+    info["margin_1x1x1"] = margin_1x1x1
+    if rep is None:
+        raise RuntimeError(
+            f"No replication up to {args.max_replication} per axis puts every bond "
+            f"image at least {args.image_margin} A ahead of its competitors "
+            f"(1x1x1 margin {margin_1x1x1:.3f} A)."
+        )
+    info["replication"] = list(rep)
+    info["margin"] = margin
+    if rep == (1, 1, 1):
+        return info
+    supercell_cif = job_dir / "supercell.cif"
+    info["supercell_cif"] = supercell_cif.name
+    mapping, labels = write_supercell_cif(cif, rep, supercell_cif)
+    info["supercell_atoms"] = mapping
+    info["lammps_cif"] = supercell_cif
+    info["cell_of_label"] = dict(zip(labels, mapping))
+    return info
+
+
 def write_json(path: Path, payload: Dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as fh:
         json.dump(sanitize_for_json(payload), fh, ensure_ascii=False, indent=2)
+
+
+# Section title, index of the anchor atom, and whether the reversed atom order is
+# the same term (bonds, angles and dihedrals) or not (impropers).
+TOPOLOGY_SECTIONS = (
+    ("Bonds", 2, 0, True),
+    ("Angles", 3, 1, True),
+    ("Dihedrals", 4, 1, True),
+    ("Impropers", 4, 0, False),
+)
+
+
+def replicate_copy0_terms(data_file: Path, atoms: List[Dict[str, Any]], rep: List[int]) -> None:
+    """Rewrite the bonded terms of a supercell data file from those of copy 0.
+
+    lammps-interface builds each Dreiding improper from three of the six neighbour
+    orderings of its centre atom, so which neighbour is the out-of-plane atom
+    depends on the order of the neighbours in its graph. That order differs
+    between supercell copies, and the supercell potential is then not invariant
+    under the unit-cell translations. Every term anchored on copy 0 (bond atom 1,
+    angle vertex, dihedral atom 2, improper centre) is translated to all other
+    copies instead, so all copies carry the same terms. Term counts are unchanged.
+    """
+    M = np.asarray(rep, dtype=int)
+    cell = {int(a["atom_id"]): (int(a["unit_cell_atom"]), tuple(a["copy"])) for a in atoms}
+    tag_of = {v: k for k, v in cell.items()}
+    shifts = [np.array(n) for n in np.ndindex(*M)]
+    lines = data_file.read_text().splitlines()
+
+    def key(tags, anchor):
+        base = np.array(cell[tags[anchor]][1])
+        return tuple(
+            (cell[t][0], tuple(int(v) for v in np.mod(np.array(cell[t][1]) - base, M)))
+            for t in tags
+        )
+
+    for title, n, anchor, reversible in TOPOLOGY_SECTIONS:
+        start = next((k for k, l in enumerate(lines) if l.split("#")[0].strip() == title), None)
+        if start is None:
+            continue
+        stop = start + 2
+        while stop < len(lines) and lines[stop].strip():
+            stop += 1
+        rows = [l.split() for l in lines[start + 2:stop]]
+        kept = []
+        for r in rows:
+            tags = [int(v) for v in r[2:2 + n]]
+            options = [tags] + ([tags[::-1]] if reversible else [])
+            keys = [(key(o, anchor), o) for o in options]
+            if reversible and keys[0][0] == keys[1][0] and tags != tags[::-1]:
+                raise ValueError(f"{title}: a term maps onto its own reverse under a translation")
+            best_key, best = min(keys)
+            if all(v == 0 for v in cell[best[anchor]][1]):
+                kept.append((int(r[1]), best_key))
+        if len(kept) * len(shifts) != len(rows):
+            raise ValueError(
+                f"{title}: {len(kept)} terms on copy 0 x {len(shifts)} copies != {len(rows)}"
+            )
+        new_rows = []
+        for s in shifts:
+            for ttype, k in kept:
+                tags = [tag_of[(p, tuple(int(v) for v in np.mod(np.array(rel) + s, M)))] for p, rel in k]
+                new_rows.append((ttype, tags))
+        if title == "Bonds":
+            old = {frozenset(int(v) for v in r[2:4]) for r in rows}
+            if {frozenset(t) for _, t in new_rows} != old:
+                raise ValueError("Replicated bonds differ from the bonds lammps-interface wrote")
+        lines[start + 2:stop] = [
+            f"{k + 1:>8} {ttype:>8} " + " ".join(f"{t:>8}" for t in tags)
+            for k, (ttype, tags) in enumerate(new_rows)
+        ]
+    data_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def run_single_job(
@@ -355,23 +487,30 @@ def run_single_job(
 
         job_dir.mkdir(parents=True, exist_ok=False)
         shutil.copy2(cif_path, job_dir / "source.cif")
+        bond_images = plan_bond_images(cif_path, job_dir, args)
+        lammps_cif = bond_images.pop("lammps_cif")
+        cell_of_label = bond_images.pop("cell_of_label", None)
+        replication = "x".join(str(v) for v in bond_images["replication"])
 
         with suppress_output():
             lammps_interface, LammpsSimulation, from_CIF = import_lammps_modules()
         FrameworkOnlyLammpsSimulation = make_framework_only_simulation_class(
             LammpsSimulation
         )
+        # options.cif_file only names the outputs, so it stays the source CIF.
         options = build_li_options(args, cif_path)
 
         with suppress_output():
             with pushd(job_dir):
-                cell, graph = from_CIF(str(cif_path))
+                cell, graph = from_CIF(str(lammps_cif))
                 sim = FrameworkOnlyLammpsSimulation(options)
                 sim.set_cell(cell)
                 sim.set_graph(graph)
                 sim.split_graph()  # hard-disabled; keeps all atoms in framework
                 sim.assign_force_fields()
-                sim.compute_simulation_size()  # hard-forced to replication = 1x1x1
+                # lammps-interface replication stays 1x1x1; any supercell is
+                # already in lammps_cif with explicit bond images.
+                sim.compute_simulation_size()
                 sim.merge_graphs()
                 sim.write_lammps_files(wd=str(job_dir))
 
@@ -391,7 +530,7 @@ def run_single_job(
             "generation_policy": {
                 "force_field": args.force_field,
                 "molecule_guest_splitting_disabled": True,
-                "forced_replication": "1x1x1",
+                "lammps_interface_replication": "1x1x1",
                 "orthogonalize": False,
                 "h_bonding": bool(args.h_bonding),
                 "dreid_bond_type": args.dreid_bond_type,
@@ -400,6 +539,7 @@ def run_single_job(
                 "tolerance": float(args.tol),
                 "neighbour_size": int(args.neighbour_size),
             },
+            "bond_images": bond_images,
             "output_files": {
                 "input_file": str(input_file),
                 "data_file": str(data_file),
@@ -422,6 +562,14 @@ def run_single_job(
             "atom_types": collect_atom_type_metadata(sim),
             "atoms": collect_atoms_metadata(sim.graph),
         }
+        if cell_of_label is not None:
+            # Unit-cell atom and copy of every supercell atom, keyed by LAMMPS
+            # atom ID through its CIF label; the relaxation symmetrizes on these.
+            for atom in metadata["atoms"]:
+                prim, *copy = cell_of_label[atom["ciflabel"]]
+                atom["unit_cell_atom"] = int(prim)
+                atom["copy"] = [int(v) for v in copy]
+            replicate_copy0_terms(data_file, metadata["atoms"], bond_images["replication"])
         write_json(metadata_file, metadata)
 
         result = JobResult(
@@ -431,6 +579,7 @@ def run_single_job(
             status="success",
             message="Conversion completed",
             duration_sec=time.time() - start,
+            replication=replication,
             atom_count=metadata["counts"]["atoms"],
             bond_count=metadata["counts"]["bonds"],
             angle_count=metadata["counts"]["angles"],
@@ -451,6 +600,7 @@ def run_single_job(
                 "job_name": result.job_name,
                 "job_dir": result.job_dir,
                 "duration_sec": result.duration_sec,
+                "replication": replication,
                 "counts": metadata["counts"],
                 "output_files": metadata["output_files"],
             },
@@ -493,6 +643,7 @@ def write_manifest(output_root: Path, results: Iterable[Dict[str, Any]]) -> Path
         "status",
         "message",
         "duration_sec",
+        "replication",
         "atom_count",
         "bond_count",
         "angle_count",
@@ -515,7 +666,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Generate LAMMPS input files in batches with lammps-interface while "
-            "disabling molecule/guest splitting and fixing replication at 1x1x1."
+            "disabling molecule/guest splitting. Structures whose intended bond "
+            "images are not the closest images are written as a supercell."
         )
     )
     parser.add_argument("input_dir", type=Path, help="Directory containing CIF files")
@@ -579,6 +731,30 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--neighbour-size", type=int, default=5, help="Neighbor-search depth"
     )
+    parser.add_argument(
+        "--supercell",
+        choices=["auto", "off"],
+        default="auto",
+        help=(
+            "auto: replicate when a bond image from the CIF bond loop is not the "
+            "closest image; off: always 1x1x1 (previous behavior)"
+        ),
+    )
+    parser.add_argument(
+        "--image-margin",
+        type=float,
+        default=1.0,
+        help=(
+            "Required gap in Angstrom between each intended bond / two-bond vector "
+            "and its nearest competing image (default: 1.0)"
+        ),
+    )
+    parser.add_argument(
+        "--max-replication",
+        type=int,
+        default=4,
+        help="Largest replication tried per axis (default: 4)",
+    )
 
     args = parser.parse_args(argv)
     if not args.input_dir.is_dir():
@@ -587,6 +763,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         )
     if args.skip_existing and args.overwrite:
         parser.error("--skip-existing and --overwrite are mutually exclusive")
+    if args.image_margin < 0 or args.max_replication < 1:
+        parser.error("--image-margin must be >= 0 and --max-replication >= 1")
     return args
 
 
