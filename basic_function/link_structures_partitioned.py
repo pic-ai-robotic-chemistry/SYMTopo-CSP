@@ -1,7 +1,25 @@
+"""Link periodic fragments using typed atom-label annotations.
+
+Use ``a_x_site_bo2`` / ``a_y_site_bo2`` for a type-a double bond. Orders
+1, 2 and 3 are supported; omitting ``_boN`` means a single bond. Legacy
+``x_site`` / ``y_site`` labels form an unnamed type. An atom can carry several
+markers, e.g. ``a_x_site_bo2__b_y_site_bo1`` (no spaces). ``__`` is reserved
+as the marker separator; type names use letters, digits and single underscores.
+Automatic symmetry, supercell and numeric copy suffixes apply to the whole
+label. A hyphen before x/y is also accepted, matching upstream normalization.
+
+Every participating fragment must have the same types and exactly one x and y
+per type, although these may share atoms. Orders must agree within each type.
+All types share one target fragment image. Duplicate physical bonds are errors.
+Declared orders are fixed during integer-order inference, but may subsequently
+be written as aromatic (A) after RDKit perception in an open three-period graph.
+"""
+
 import concurrent.futures
 import heapq
 import os
 import random
+import re
 from collections import Counter, deque
 from contextlib import redirect_stdout
 from functools import partial
@@ -74,6 +92,39 @@ RD_BOND_TYPE_FROM_ORDER = {
     3: Chem.BondType.TRIPLE if HAS_RDKIT else None,
 }
 CCDC_TYPE_FROM_ORDER = {1: "S", 2: "D", 3: "T"}
+
+SITE_MARKER_RE = re.compile(
+    r"(?:(?P<kind>[A-Za-z][A-Za-z0-9_]*?)[_-])?"
+    r"(?P<role>[xy])_site(?:_bo(?P<order>[123]))?"
+)
+# Negative supercell indices become double underscores during normalization.
+SITE_COPY_SUFFIX_RE = re.compile(
+    r"(?:_s\d+|_sc_[-_]?\d+_[-_]?\d+_[-_]?\d+|_\d+)+$"
+)
+
+
+def parse_site_label(label):
+    """Return all (type, role, order) markers, ignoring ordinary atom labels."""
+    if not isinstance(label, str) or "_site" not in label:
+        return []
+    base = SITE_COPY_SUFFIX_RE.sub("", label)
+    markers = []
+    seen = set()
+    for token in base.split("__"):
+        match = SITE_MARKER_RE.fullmatch(token)
+        if match is None:
+            raise ValueError(
+                f"Invalid connection label {label!r}: expected "
+                "[type_]x_site[_bo1/2/3] or [type_]y_site[_bo1/2/3], "
+                "separated by '__'."
+            )
+        kind = match.group("kind") or ""
+        role = match.group("role")
+        if (kind, role) in seen:
+            raise ValueError(f"Repeated {kind or 'default'}-{role} marker in {label!r}.")
+        seen.add((kind, role))
+        markers.append((kind, role, int(match.group("order") or 1)))
+    return markers
 
 
 def get_cycles(assignment):
@@ -262,80 +313,131 @@ def find_and_link_sites(atoms: ase.Atoms, nl: NeighborList):
 
     labels = atoms.arrays["label"]
 
-    x_sites_idx = [
-        i for i, lbl in enumerate(labels) if isinstance(lbl, str) and "x_site" in lbl
-    ]
-    y_sites_idx = [
-        i for i, lbl in enumerate(labels) if isinstance(lbl, str) and "y_site" in lbl
-    ]
+    matrix = nl.get_connectivity_matrix(sparse=True).tocsr()
+    _, component_list = sparse.csgraph.connected_components(matrix)
+    fragments = {}
+    orders = {}
+    for idx, label in enumerate(labels):
+        for kind, role, order in parse_site_label(label):
+            component = int(component_list[idx])
+            sites = fragments.setdefault(component, {}).setdefault(kind, {})
+            if role in sites:
+                previous = sites[role]
+                raise ValueError(
+                    f"Fragment {component} has duplicate {kind or 'default'}-{role} "
+                    f"sites: atoms {previous} ({labels[previous]!r}) and {idx} ({label!r})."
+                )
+            if kind in orders and orders[kind] != order:
+                raise ValueError(
+                    f"Conflicting bond orders for type {kind or 'default'!r}: "
+                    f"{orders[kind]} and {order} at atom {idx} ({label!r})."
+                )
+            orders[kind] = order
+            sites[role] = idx
 
-    if (
-        len(x_sites_idx) == 0
-        or len(y_sites_idx) == 0
-        or len(x_sites_idx) != len(y_sites_idx)
-    ):
+    if not fragments:
         return None
 
-    matrix = nl.get_connectivity_matrix(sparse=True).tolil()
-    n_components, component_list = sparse.csgraph.connected_components(matrix.tocsr())
+    component_ids = sorted(fragments)
+    kinds = sorted(orders)
+    x_indices = []
+    y_indices = []
+    for component in component_ids:
+        sites = fragments[component]
+        if set(sites) != set(kinds):
+            raise ValueError(
+                f"Fragment {component} has connection types {sorted(sites)!r}; "
+                f"expected {kinds!r}."
+            )
+        for kind in kinds:
+            if set(sites[kind]) != {"x", "y"}:
+                raise ValueError(
+                    f"Fragment {component}, type {kind or 'default'!r} "
+                    "must contain exactly one x site and one y site."
+                )
+        x_indices.append([sites[kind]["x"] for kind in kinds])
+        y_indices.append([sites[kind]["y"] for kind in kinds])
 
-    paired_indices = []
-    for mol_idx in range(n_components):
-        atom_indices = np.where(component_list == mol_idx)[0].tolist()
-        tmp_x_sites_idx = [idx for idx in x_sites_idx if idx in atom_indices]
-        tmp_y_sites_idx = [idx for idx in y_sites_idx if idx in atom_indices]
-        if len(tmp_x_sites_idx) == 0 and len(tmp_y_sites_idx) == 0:
-            continue
-        if len(tmp_x_sites_idx) != 1 or len(tmp_y_sites_idx) != 1:
-            return None
-        paired_indices.append((tmp_x_sites_idx[0], tmp_y_sites_idx[0]))
-
-    eff_components = len(paired_indices)
-    if eff_components == 0:
-        return None
+    x_indices = np.asarray(x_indices, dtype=int)
+    y_indices = np.asarray(y_indices, dtype=int)
+    eff_components = len(component_ids)
 
     pbc = atoms.get_pbc()
+    if not np.any(pbc):
+        return None  # Every assignment would form finite molecular cycles.
     cell = atoms.get_cell()
     inv_cell = np.linalg.inv(cell)
 
-    x_indices, y_indices = zip(*paired_indices)
-    x_positions = atoms.positions[list(x_indices)]
-    y_positions = atoms.positions[list(y_indices)]
-    x2y_vecs_mic, x2y_distances = get_distances(
-        x_positions, y_positions, cell=cell, pbc=pbc
-    )
-    x2y_vecs_raw = y_positions[np.newaxis, :, :] - x_positions[:, np.newaxis, :]
-    x2y_offsets = np.round((x2y_vecs_mic - x2y_vecs_raw) @ inv_cell).astype(int)
-
-    y2x_offsets = np.zeros((eff_components, 3), dtype=int)
+    # Unwrap every fragment relative to its first y site. Shared atoms have
+    # one offset even when they carry several different connection markers.
+    x_offsets = np.zeros((*x_indices.shape, 3), dtype=int)
+    y_offsets = np.zeros_like(x_offsets)
     for i in range(eff_components):
-        x_idx, y_idx = paired_indices[i]
-        y2x_offsets[i] = get_total_cell_offset(nl, y_idx, x_idx)
+        anchor = int(y_indices[i, 0])
+        offsets = {
+            int(idx): get_total_cell_offset(nl, anchor, int(idx))
+            for idx in set(x_indices[i]) | set(y_indices[i])
+        }
+        x_offsets[i] = [offsets[int(idx)] for idx in x_indices[i]]
+        y_offsets[i] = [offsets[int(idx)] for idx in y_indices[i]]
+    x_positions = atoms.positions[x_indices] + x_offsets @ cell
+    y_positions = atoms.positions[y_indices] + y_offsets @ cell
+    x_centers = x_positions.mean(axis=1)
+    y_centers = y_positions.mean(axis=1)
 
-        # Break self-loops by selecting the next-nearest periodic image.
-        if np.all((y2x_offsets[i] + x2y_offsets[i, i]) == 0):
-            x2y_dist_tmp, x2y_vec_tmp = kth_periodic_distance(atoms, x_idx, y_idx, k=2)
-            x2y_distances[i, i] = x2y_dist_tmp
-            x2y_vecs_mic[i, i] = x2y_vec_tmp
-            x2y_offsets[i, i] = np.round(
-                (x2y_vec_tmp - x2y_vecs_raw[i, i]) @ inv_cell
+    # Sum_t |d_t + shift|^2 = count * |mean(d_t) + shift|^2 + constant.
+    # Thus the centroid MIC minimizes all bond lengths for ONE fragment image.
+    center_vecs, _ = get_distances(x_centers, y_centers, cell=cell, pbc=pbc)
+    center_raw = y_centers[np.newaxis, :, :] - x_centers[:, np.newaxis, :]
+    fragment_offsets = np.rint((center_vecs - center_raw) @ inv_cell).astype(int)
+    centers = ase.Atoms(
+        positions=np.concatenate([x_centers, y_centers]), cell=cell, pbc=pbc
+    )
+    for i in range(eff_components):
+        # Avoid linking a fragment back onto itself in the same image. In a
+        # distance tie the second image can still be the zero-offset image.
+        k = 2
+        while np.all(fragment_offsets[i, i] == 0):
+            _, vector = kth_periodic_distance(centers, i, eff_components + i, k=k)
+            fragment_offsets[i, i] = np.rint(
+                (vector - center_raw[i, i]) @ inv_cell
             ).astype(int)
+            k += 1
 
-    x2y_dist_sqr = x2y_distances**2
+    x2y_dist_sqr = np.zeros((eff_components, eff_components), dtype=float)
+    translations = fragment_offsets @ cell
+    for t in range(len(kinds)):
+        vectors = (
+            y_positions[np.newaxis, :, t, :]
+            - x_positions[:, np.newaxis, t, :]
+            + translations
+        )
+        x2y_dist_sqr += np.sum(vectors**2, axis=-1)
+    y2x_offsets = x_offsets[:, 0, :]
+    x2y_offsets = fragment_offsets - y2x_offsets[:, np.newaxis, :]
     cost, assignment = solve_minimal_path(x2y_dist_sqr, y2x_offsets, x2y_offsets)
 
     if cost is None or assignment is None:
         return None
 
     new_links = []
-    for i in range(len(assignment)):
-        j = assignment[i]
-        x_idx = paired_indices[i][0]
-        y_idx = paired_indices[j][1]
-        offset = x2y_offsets[i, j]
-        new_links.append((x_idx, y_idx, offset))
+    for i, j in enumerate(assignment):
+        for t, kind in enumerate(kinds):
+            offset = fragment_offsets[i, j] + y_offsets[j, t] - x_offsets[i, t]
+            new_links.append(
+                {
+                    "idx1": int(x_indices[i, t]),
+                    "idx2": int(y_indices[j, t]),
+                    "offset": tuple(int(value) for value in offset),
+                    "site_type": kind,
+                    "fixed_order": orders[kind],
+                    "source_component": component_ids[i],
+                    "target_component": component_ids[j],
+                }
+            )
 
-    return matrix.tocsr(), new_links
+    validate_unique_bonds(atoms, new_links)
+    return matrix, new_links
 
 
 def is_probable_metal(symbol: str) -> bool:
@@ -378,15 +480,25 @@ def get_max_extra_valence(symbol: str, degree: int) -> int:
 
 
 def estimate_extra_bond_capacity(
-    symbol1: str, symbol2: str, degree1: int, degree2: int, is_new: bool
+    symbol1: str,
+    symbol2: str,
+    degree1: int,
+    degree2: int,
+    is_new: bool,
+    base_valence1=None,
+    base_valence2=None,
 ) -> int:
     if is_new:
         return 0
     if not supports_multiple_bond(symbol1) or not supports_multiple_bond(symbol2):
         return 0
 
-    headroom1 = get_max_extra_valence(symbol1, degree1)
-    headroom2 = get_max_extra_valence(symbol2, degree2)
+    headroom1 = get_max_extra_valence(
+        symbol1, degree1 if base_valence1 is None else base_valence1
+    )
+    headroom2 = get_max_extra_valence(
+        symbol2, degree2 if base_valence2 is None else base_valence2
+    )
     if headroom1 <= 0 or headroom2 <= 0:
         return 0
 
@@ -416,6 +528,30 @@ def get_bond_extra_cost(symbol1: str, symbol2: str, distance: float) -> float:
     return max(0.02, 0.10 * ratio)
 
 
+def validate_unique_bonds(atoms, bonds):
+    """Reject the same physical bond, including reverse periodic duplicates."""
+    seen = {}
+    labels = atoms.arrays.get("label")
+    for bond in bonds:
+        idx1, idx2 = bond["idx1"], bond["idx2"]
+        offset = tuple(int(value) for value in bond["offset"])
+        forward = (idx1, idx2, *offset)
+        reverse = (idx2, idx1, *(-value for value in offset))
+        key = min(forward, reverse)
+        if idx1 == idx2 and not any(offset):
+            raise ValueError(f"Connection at atom {idx1} points to the very same atom.")
+        if key in seen:
+            previous = seen[key]
+            names = f"{labels[idx1]!r}, {labels[idx2]!r}" if labels is not None else ""
+            raise ValueError(
+                f"Duplicate physical bond between atoms {idx1}, {idx2} ({names}), "
+                f"offset {offset}: types {previous.get('site_type', 'internal')!r} "
+                f"and {bond.get('site_type', 'internal')!r}. "
+                "Use one marker with bo2/bo3 to specify a multiple bond."
+            )
+        seen[key] = bond
+
+
 def build_bond_records(atoms, matrix, new_links):
     upper_triangle = sparse.triu(matrix, k=1)
     rows, cols = upper_triangle.nonzero()
@@ -423,8 +559,12 @@ def build_bond_records(atoms, matrix, new_links):
     cell = atoms.get_cell()
     inv_cell = np.linalg.inv(cell)
     vecs_raw = atoms.positions[cols] - atoms.positions[rows]
-    vecs_mic, dists = conditional_find_mic(vecs_raw, cell, atoms.get_pbc())
-    offsets = np.round((vecs_mic - vecs_raw) @ inv_cell).astype(int)
+    if len(rows):
+        vecs_mic, dists = conditional_find_mic(vecs_raw, cell, atoms.get_pbc())
+        offsets = np.round((vecs_mic - vecs_raw) @ inv_cell).astype(int)
+    else:
+        dists = np.empty(0)
+        offsets = np.empty((0, 3), dtype=int)
 
     bond_records = []
     for idx1, idx2, dist, offset in zip(
@@ -441,23 +581,23 @@ def build_bond_records(atoms, matrix, new_links):
             }
         )
 
-    for idx1, idx2, offset in new_links:
-        idx1 = int(idx1)
-        idx2 = int(idx2)
-        offset = np.asarray(offset, dtype=int)
+    for link in new_links:
+        idx1 = link["idx1"]
+        idx2 = link["idx2"]
+        offset = np.asarray(link["offset"], dtype=int)
         vec = atoms.positions[idx2] - atoms.positions[idx1] + offset @ cell
         dist = float(np.linalg.norm(vec))
         bond_records.append(
             {
-                "idx1": idx1,
-                "idx2": idx2,
+                **link,
                 "dist": dist,
                 "offset": tuple(int(x) for x in offset.tolist()),
                 "is_new": True,
-                "bond_type": "S",
+                "bond_type": CCDC_TYPE_FROM_ORDER[link["fixed_order"]],
             }
         )
 
+    validate_unique_bonds(atoms, bond_records)
     return bond_records
 
 
@@ -469,7 +609,22 @@ def compute_global_degrees(n_atoms: int, bond_records):
     return degrees
 
 
-def get_variable_bond_components(atoms, bond_records, global_degrees):
+def compute_base_valences(n_atoms: int, bond_records):
+    """Count fixed new orders and one unit per internal bond before inference."""
+    valences = np.zeros(n_atoms, dtype=int)
+    for bond in bond_records:
+        order = bond.get("fixed_order", 1) if bond["is_new"] else 1
+        # A bond to another image of the same atom contributes at BOTH ends.
+        valences[bond["idx1"]] += order
+        valences[bond["idx2"]] += order
+    return valences
+
+
+def get_variable_bond_components(
+    atoms, bond_records, global_degrees, base_valences=None
+):
+    if base_valences is None:
+        base_valences = compute_base_valences(len(atoms), bond_records)
     adjacency = {}
     variable_atoms = set()
     variable_bond_indices = []
@@ -483,6 +638,8 @@ def get_variable_bond_components(atoms, bond_records, global_degrees):
             int(global_degrees[idx1]),
             int(global_degrees[idx2]),
             bond["is_new"],
+            int(base_valences[idx1]),
+            int(base_valences[idx2]),
         )
         if cap <= 0:
             continue
@@ -522,13 +679,28 @@ def get_variable_bond_components(atoms, bond_records, global_degrees):
 
 
 def solve_component_bond_orders(
-    atoms, component_atom_indices, component_bond_indices, bond_records, global_degrees
+    atoms,
+    component_atom_indices,
+    component_bond_indices,
+    bond_records,
+    global_degrees,
+    base_valences=None,
 ):
+    if base_valences is None:
+        base_valences = compute_base_valences(len(atoms), bond_records)
     atom_to_local = {
         atom_idx: local_idx for local_idx, atom_idx in enumerate(component_atom_indices)
     }
     symbols = [atoms[atom_idx].symbol for atom_idx in component_atom_indices]
     degrees = [int(global_degrees[atom_idx]) for atom_idx in component_atom_indices]
+    base = [int(base_valences[atom_idx]) for atom_idx in component_atom_indices]
+    default_orders = {
+        bond_idx: (
+            bond_records[bond_idx].get("fixed_order", 1)
+            if bond_records[bond_idx]["is_new"] else 1
+        )
+        for bond_idx in component_bond_indices
+    }
 
     variable_bonds = []
     fixed_orders = {}
@@ -542,14 +714,16 @@ def solve_component_bond_orders(
             degrees[i_local],
             degrees[j_local],
             bond["is_new"],
+            base[i_local],
+            base[j_local],
         )
         if cap <= 0:
-            fixed_orders[bond_idx] = 1
+            fixed_orders[bond_idx] = default_orders[bond_idx]
         else:
             variable_bonds.append((bond_idx, i_local, j_local, cap))
 
     candidate_valences = [
-        get_candidate_valences(sym, deg) for sym, deg in zip(symbols, degrees)
+        get_candidate_valences(sym, valence) for sym, valence in zip(symbols, base)
     ]
 
     n_y = len(variable_bonds)
@@ -557,7 +731,7 @@ def solve_component_bond_orders(
     n_var = n_y + n_z
 
     if n_var == 0:
-        return {bond_idx: 1 for bond_idx in component_bond_indices}
+        return default_orders
 
     c = np.zeros(n_var, dtype=float)
     lower = np.zeros(n_var, dtype=float)
@@ -610,8 +784,8 @@ def solve_component_bond_orders(
             col_idx.append(var_idx)
             values.append(-float(valence))
 
-        lb.append(-float(degrees[atom_local]))
-        ub.append(-float(degrees[atom_local]))
+        lb.append(-float(base[atom_local]))
+        ub.append(-float(base[atom_local]))
         current_row += 1
 
     A = sparse.csc_matrix((values, (row_idx, col_idx)), shape=(current_row, n_var))
@@ -623,7 +797,7 @@ def solve_component_bond_orders(
     result = milp(c=c, integrality=integrality, bounds=bounds, constraints=constraints)
 
     if not result.success or result.x is None:
-        return {bond_idx: 1 for bond_idx in component_bond_indices}
+        return default_orders
 
     x = np.rint(result.x).astype(int)
     bond_orders = dict(fixed_orders)
@@ -631,61 +805,119 @@ def solve_component_bond_orders(
         bond_orders[bond_idx] = int(1 + x[y_idx])
 
     for bond_idx in component_bond_indices:
-        bond_orders.setdefault(bond_idx, 1)
+        bond_orders.setdefault(bond_idx, default_orders[bond_idx])
 
     return bond_orders
 
 
-def aromaticize_component_bonds(
-    atoms, component_atom_indices, component_bond_indices, bond_records, bond_orders
+def aromaticize_periodic_component(
+    atoms, atom_offsets, component_bond_indices, bond_records, bond_orders
 ):
-    if not HAS_RDKIT:
-        return {}
+    """Perceive an open three-period lift; return original bond-record indices.
 
-    atom_to_local = {
-        atom_idx: local_idx for local_idx, atom_idx in enumerate(component_atom_indices)
-    }
-    rw_mol = Chem.RWMol()
-    for atom_idx in component_atom_indices:
-        rw_mol.AddAtom(Chem.Atom(atoms[atom_idx].symbol))
-
-    fixed_new_pairs = set()
+    Tree offsets unwrap one representative of each atom. Nonzero residuals
+    around cycles generate the translation of the fragment assignment cycle.
+    A finite component needs one copy; a 1D component gets copies -1, 0, 1.
+    This is independent of which atoms happen to be wrapped into the CIF cell.
+    """
+    residuals = []
     for bond_idx in component_bond_indices:
         bond = bond_records[bond_idx]
-        pair = tuple(sorted((bond["idx1"], bond["idx2"])))
-        if bond["is_new"]:
-            fixed_new_pairs.add(pair)
-
-        order = max(1, min(3, int(bond_orders.get(bond_idx, 1))))
-        rd_bond_type = RD_BOND_TYPE_FROM_ORDER.get(order)
-        if rd_bond_type is None:
-            return {}
-        rw_mol.AddBond(
-            atom_to_local[bond["idx1"]], atom_to_local[bond["idx2"]], rd_bond_type
+        residuals.append(
+            atom_offsets[bond["idx1"]]
+            + np.asarray(bond["offset"], dtype=int)
+            - atom_offsets[bond["idx2"]]
         )
+    nonzero = [value for value in residuals if np.any(value)]
+    period = np.zeros(3, dtype=int)
+    layers = (0,)
+    if nonzero:
+        direction = nonzero[0] // np.gcd.reduce(np.abs(nonzero[0]))
+        pivot = int(np.flatnonzero(direction)[0])
+        multiples = []
+        for value in nonzero:
+            multiple, remainder = divmod(int(value[pivot]), int(direction[pivot]))
+            if remainder or not np.array_equal(value, multiple * direction):
+                # Higher-dimensional networks are outside the 1D linker model.
+                return {}
+            multiples.append(abs(multiple))
+        period = direction * np.gcd.reduce(multiples)
+        layers = (-1, 0, 1)
 
-    mol = rw_mol.GetMol()
     try:
+        rw_mol = Chem.RWMol()
+        node_indices = {}
+        for layer in layers:
+            for atom_idx, offset in atom_offsets.items():
+                key = (atom_idx, tuple(offset + layer * period))
+                node_indices[key] = rw_mol.AddAtom(Chem.Atom(atoms[atom_idx].symbol))
+
+        bond_mapping = []
+        for layer in layers:
+            for bond_idx in component_bond_indices:
+                bond = bond_records[bond_idx]
+                image = atom_offsets[bond["idx1"]] + layer * period
+                source = (bond["idx1"], tuple(image))
+                target = (bond["idx2"], tuple(image + bond["offset"]))
+                if target not in node_indices:
+                    continue  # Open boundaries: never reconnect the end copies.
+                order = int(bond_orders[bond_idx])
+                rw_mol.AddBond(
+                    node_indices[source],
+                    node_indices[target],
+                    RD_BOND_TYPE_FROM_ORDER[order],
+                )
+                bond_mapping.append((bond_idx, layer == 0))
+
+        mol = rw_mol.GetMol()
         mol.UpdatePropertyCache(strict=False)
         rdmolops.FastFindRings(mol)
         rdmolops.SetConjugation(mol)
         rdmolops.SetHybridization(mol)
         rdmolops.SetAromaticity(mol)
+        return {
+            bond_idx: "A"
+            for rd_bond, (bond_idx, is_middle) in zip(mol.GetBonds(), bond_mapping)
+            if is_middle and rd_bond.GetIsAromatic()
+        }
     except Exception:
         return {}
 
-    aromatic_pairs = {}
-    for rd_bond in mol.GetBonds():
-        if not rd_bond.GetIsAromatic():
-            continue
-        global_i = component_atom_indices[rd_bond.GetBeginAtomIdx()]
-        global_j = component_atom_indices[rd_bond.GetEndAtomIdx()]
-        pair = tuple(sorted((global_i, global_j)))
-        if pair in fixed_new_pairs:
-            continue
-        aromatic_pairs[pair] = "A"
 
-    return aromatic_pairs
+def aromaticize_bonds(atoms, bond_records, bond_orders):
+    """Include fixed/new bonds and all neighbors in each perception component."""
+    if not HAS_RDKIT:
+        return {}
+    adjacency = {}
+    for bond_idx, bond in enumerate(bond_records):
+        idx1, idx2 = bond["idx1"], bond["idx2"]
+        offset = np.asarray(bond["offset"], dtype=int)
+        adjacency.setdefault(idx1, []).append((idx2, offset, bond_idx))
+        adjacency.setdefault(idx2, []).append((idx1, -offset, bond_idx))
+
+    visited = set()
+    aromatic = {}
+    for root in sorted(adjacency):
+        if root in visited:
+            continue
+        offsets = {root: np.zeros(3, dtype=int)}
+        queue = deque([root])
+        visited.add(root)
+        component_bonds = set()
+        while queue:
+            idx = queue.popleft()
+            for neighbor, offset, bond_idx in adjacency[idx]:
+                component_bonds.add(bond_idx)
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    offsets[neighbor] = offsets[idx] + offset
+                    queue.append(neighbor)
+        aromatic.update(
+            aromaticize_periodic_component(
+                atoms, offsets, sorted(component_bonds), bond_records, bond_orders
+            )
+        )
+    return aromatic
 
 
 def assign_bond_types(atoms, bond_records):
@@ -693,16 +925,20 @@ def assign_bond_types(atoms, bond_records):
         return bond_records
 
     global_degrees = compute_global_degrees(len(atoms), bond_records)
-    component_atom_lists, component_bond_lists, variable_bond_indices = (
+    base_valences = compute_base_valences(len(atoms), bond_records)
+    component_atom_lists, component_bond_lists, _ = (
         get_variable_bond_components(
             atoms,
             bond_records,
             global_degrees,
+            base_valences,
         )
     )
 
-    global_orders = {bond_idx: 1 for bond_idx in range(len(bond_records))}
-    aromatic_pairs = {}
+    global_orders = {
+        bond_idx: bond.get("fixed_order", 1) if bond["is_new"] else 1
+        for bond_idx, bond in enumerate(bond_records)
+    }
 
     for comp_atoms, comp_bonds in zip(component_atom_lists, component_bond_lists):
         if not comp_bonds:
@@ -714,38 +950,24 @@ def assign_bond_types(atoms, bond_records):
             comp_bonds,
             bond_records,
             global_degrees,
+            base_valences,
         )
         global_orders.update(comp_orders)
 
-        comp_aromatic = aromaticize_component_bonds(
-            atoms, comp_atoms, comp_bonds, bond_records, comp_orders
-        )
-        aromatic_pairs.update(comp_aromatic)
-
+    aromatic_bonds = aromaticize_bonds(atoms, bond_records, global_orders)
     for bond_idx, bond in enumerate(bond_records):
-        if bond["is_new"]:
-            bond["bond_type"] = "S"
-            continue
-
-        if bond_idx not in variable_bond_indices:
-            bond["bond_type"] = "S"
-            continue
-
-        pair = tuple(sorted((bond["idx1"], bond["idx2"])))
-        if pair in aromatic_pairs:
-            bond["bond_type"] = "A"
-            continue
-
-        order = int(global_orders.get(bond_idx, 1))
-        bond["bond_type"] = CCDC_TYPE_FROM_ORDER.get(order, "S")
+        bond["bond_type"] = aromatic_bonds.get(
+            bond_idx, CCDC_TYPE_FROM_ORDER[global_orders[bond_idx]]
+        )
 
     return bond_records
 
 
 def generate_bonds(atoms, cutoff_multi=1.05):
     cutoffs = natural_cutoffs(atoms, mult=cutoff_multi)
+    # The neighbor list defines bonds; its reuse buffer would add false bonds.
     nl = build_neighbor_list(
-        atoms, cutoffs=cutoffs, self_interaction=False, bothways=True
+        atoms, cutoffs=cutoffs, skin=0.0, self_interaction=False, bothways=True
     )
 
     tmp = find_and_link_sites(atoms, nl)
