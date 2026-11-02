@@ -36,7 +36,7 @@ if __name__ == "__main__":
     workers = args.workers
 
     script_path = Path(__file__).resolve().parent / "basic_scripts"
-    conformer_file = path / "conformers" / "conformer_tar.xyz"
+    conformer_path = path / "conformers"
     ori_path = path / "structures_ori"
     linked_path = path / "linked_structures"
     lammps_path = path / "lammps_data"
@@ -44,19 +44,23 @@ if __name__ == "__main__":
     output_path = path / "structures"
     bad_path = path / "bad_structures"
 
-    molecule = format_parser.read_xyz_file(conformer_file)
-
     if args.generate_only:
         ori_path = output_path
-    packaged_function.CSP_generater_parallel(
-        [molecule],
-        ori_path,
-        need_structure=25,
-        space_group_list=[14, 2, 19, 4, 33, 9, 1, 5, 29, 7],
-        add_name=name,
-        max_workers=workers,
-        start_seed="auto",
-    )
+
+    conformer_files = sorted(conformer_path.glob("conformer_*.xyz"))
+    for conformer_file in conformer_files:
+        molecule = format_parser.read_xyz_file(conformer_file)
+        suffix = conformer_file.stem.removeprefix("conformer_").removesuffix(".xyz")
+        packaged_function.CSP_generater_parallel(
+            [molecule],
+            ori_path,
+            need_structure=1000,
+            space_group_list=[14, 2, 19, 4, 33, 9, 1, 5, 29, 7],
+            add_name=f"{name}_{suffix}",
+            max_workers=workers,
+            start_seed="auto",
+        )
+
     if args.generate_only:
         print("Structure generation completed. Exiting as --generate_only flag is set.")
         sys.exit(0)

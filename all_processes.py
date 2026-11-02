@@ -40,6 +40,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--smiles", type=str, default="", help="SMILES string of the molecule"
     )
+    parser.add_argument(
+        "--make_template",
+        action="store_true",
+        help="With --smiles, only write conformers/label_template.xyz for labeling",
+    )
 
     args = parser.parse_args()
     os.makedirs(args.path, exist_ok=True)
@@ -53,6 +58,7 @@ if __name__ == "__main__":
     if args.smiles != "":
         subprocess.run(
             [sys.executable, conformer_path, args.smiles, "--path", args.path]
+            + (["--make_template"] if args.make_template else [])
         )
     else:
         subprocess.run(
