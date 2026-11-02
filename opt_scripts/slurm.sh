@@ -11,8 +11,8 @@
 
 set -eo pipefail
 
-if [[ $# -ne 4 ]]; then
-    echo "Usage: $0 N_JOBS TARGET_PATH TARGET_FOLDER PYTHON_SCRIPT" >&2
+if [[ $# -lt 4 || $# -gt 5 ]]; then
+    echo "Usage: $0 N_JOBS TARGET_PATH TARGET_FOLDER PYTHON_SCRIPT [USE_GPU_OPTIMIZER]" >&2
     exit 2
 fi
 
@@ -20,6 +20,12 @@ N_JOBS="$1"
 TARGET_PATH="$2"
 TARGET_FOLDER="$3"
 PYTHON_SCRIPT="$4"
+USE_GPU_OPTIMIZER="${5:-0}"
+
+if [[ "$USE_GPU_OPTIMIZER" != 0 && "$USE_GPU_OPTIMIZER" != 1 ]]; then
+    echo "Error: USE_GPU_OPTIMIZER must be 0 or 1, got: $USE_GPU_OPTIMIZER" >&2
+    exit 2
+fi
 
 PYTHON_EXECUTABLE="${PYTHON_EXECUTABLE:-python}"
 
@@ -79,12 +85,19 @@ echo "Parallel workers             : $N_JOBS"
 echo "Target path                  : $TARGET_PATH"
 echo "Target CIF folder            : $TARGET_CIF_DIR"
 echo "Python script                : $PYTHON_SCRIPT"
+echo "GPU optimizer                : $([[ "$USE_GPU_OPTIMIZER" == 1 ]] && echo enabled || echo disabled)"
 echo
 
-"$PYTHON_EXECUTABLE" "$PYTHON_SCRIPT" \
-    --path "$TARGET_PATH" \
-    --target_folder "$TARGET_CIF_DIR" \
+PYTHON_ARGS=(
+    --path "$TARGET_PATH"
+    --target_folder "$TARGET_CIF_DIR"
     --n_jobs "$N_JOBS"
+)
+if [[ "$USE_GPU_OPTIMIZER" == 1 ]]; then
+    PYTHON_ARGS+=(--use_gpu_optimizer)
+fi
+
+"$PYTHON_EXECUTABLE" "$PYTHON_SCRIPT" "${PYTHON_ARGS[@]}"
 
 echo
 echo "---------------------------------------------------------"

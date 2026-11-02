@@ -10,6 +10,7 @@ usage() {
     echo "  -t, --target-folder FOLDER  CIF directory, relative to PATH or absolute (default: structures)."
     echo "  -g, --gpu-count COUNT       Number of SLURM jobs/GPUs to request (default: 8)."
     echo "  -n, --tasks-per-node COUNT  Number of MACE workers in each job (default: 10)."
+    echo "  -o, --use-gpu-optimizer     Use the CUDA BFGS optimizer in MACE workers."
     echo "  -h, --help                  Show this help message and exit."
     echo
     echo "Example:"
@@ -21,6 +22,7 @@ TARGET_PATH="${TARGET_PATH:-.}"
 TARGET_FOLDER="${TARGET_FOLDER:-structures}"
 GPU_COUNT="${GPU_COUNT:-8}"
 TASKS_PER_NODE="${TASKS_PER_NODE:-10}"
+USE_GPU_OPTIMIZER="${USE_GPU_OPTIMIZER:-0}"
 JOB_NAME_BASE="${JOB_NAME_BASE:-opt}"
 
 while [[ $# -gt 0 ]]; do
@@ -59,6 +61,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --tasks-per-node=*)
             TASKS_PER_NODE="${1#*=}"
+            shift
+            ;;
+        -o|--use-gpu-optimizer)
+            USE_GPU_OPTIMIZER=1
             shift
             ;;
         -h|--help)
@@ -101,6 +107,11 @@ for VALUE_NAME in GPU_COUNT TASKS_PER_NODE; do
     fi
 done
 
+if [[ "$USE_GPU_OPTIMIZER" != 0 && "$USE_GPU_OPTIMIZER" != 1 ]]; then
+    echo "Error: USE_GPU_OPTIMIZER must be 0 or 1, got: $USE_GPU_OPTIMIZER" >&2
+    exit 2
+fi
+
 if [[ ! -d "$TARGET_PATH" ]]; then
     echo "Error: target path does not exist: $TARGET_PATH" >&2
     exit 2
@@ -128,6 +139,7 @@ echo "Target CIF folder : $TARGET_CIF_DIR"
 echo "Log directory     : $LOG_DIR"
 echo "GPU count         : $GPU_COUNT"
 echo "Workers per job   : $TASKS_PER_NODE"
+echo "GPU optimizer     : $([[ "$USE_GPU_OPTIMIZER" == 1 ]] && echo enabled || echo disabled)"
 echo "Python script     : $PYTHON_SCRIPT"
 
 for ((i = 1; i <= GPU_COUNT; i++)); do
@@ -135,7 +147,7 @@ for ((i = 1; i <= GPU_COUNT; i++)); do
     echo "Submitting job $i/$GPU_COUNT: name=$CURRENT_JOB_NAME, workers=$TASKS_PER_NODE"
 
     # Command-line options override the corresponding defaults in slurm.sh.
-    # The four trailing values become positional arguments inside slurm.sh.
+    # The five trailing values become positional arguments inside slurm.sh.
     sbatch \
         -J "$CURRENT_JOB_NAME" \
         --ntasks-per-node="$TASKS_PER_NODE" \
@@ -145,7 +157,8 @@ for ((i = 1; i <= GPU_COUNT; i++)); do
         "$TASKS_PER_NODE" \
         "$TARGET_PATH" \
         "$TARGET_CIF_DIR" \
-        "$PYTHON_SCRIPT"
+        "$PYTHON_SCRIPT" \
+        "$USE_GPU_OPTIMIZER"
 done
 
 echo "All jobs were submitted successfully."

@@ -2,6 +2,7 @@
 !/.vscode/settings.json
 **/__pycache__/
 /example/**
+/test/**
 !/example/conformers/
 !/example/conformers/conformer_tar.xyz
 !/example/refs/

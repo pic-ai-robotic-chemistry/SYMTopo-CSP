@@ -41,6 +41,7 @@ class MultiScriptOptimizer(CrystalOptimizer):
         self.gpu_list = kwargs.get("gpu_list", [0])
         self.gpu_cnt = len(self.gpu_list)
         self.jobs_per_gpu = kwargs.get("jobs_per_gpu", 10)
+        self.use_gpu_optimizer = kwargs.get("use_gpu_optimizer", False)
 
     def start_optimize(self) -> None:
         if len(self.gpu_list) == 0:
@@ -62,6 +63,8 @@ class MultiScriptOptimizer(CrystalOptimizer):
         ]
         if gpu_id == "":
             command.append("--use_cpu_only")
+        elif self.use_gpu_optimizer:
+            command.append("--use_gpu_optimizer")
         my_env = os.environ.copy()
         my_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         process = subprocess.Popen(command, env=my_env)
@@ -128,6 +131,11 @@ if __name__ == "__main__":
         default=default_jobs_per_gpu,
         help="Number of jobs to run per GPU",
     )
+    parser.add_argument(
+        "--use_gpu_optimizer",
+        action="store_true",
+        help="Flag to use GPU optimizer for calculations",
+    )
     args = parser.parse_args()
 
     print(f"Starting optimization at {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
@@ -135,6 +143,7 @@ if __name__ == "__main__":
         results_dir=args.path,
         gpu_list=args.gpu_list,
         jobs_per_gpu=args.jobs_per_gpu,
+        use_gpu_optimizer=args.use_gpu_optimizer,
     )
     optimizer.start_optimize()
     optimizer.wait_for_completion()

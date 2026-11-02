@@ -11,7 +11,6 @@ from contextlib import redirect_stdout
 import torch
 from ase.filters import FrechetCellFilter
 from ase.io import read, write
-from ase.optimize import BFGS
 from joblib import Parallel, delayed
 from mace.calculators import mace_mp, mace_off
 
@@ -67,14 +66,14 @@ def run_calculation_one(file, calc):
             crystal = read(target_path)
             crystal.calc = calc
             sf = FrechetCellFilter(crystal, scalar_pressure=0.0006)
-            optimizer = BFGS(sf)
+            optimizer = optimizer_class(sf)
             optimizer.run(fmax=0.01, steps=3000)
             crystal.write(press_path)
 
             crystal = read(press_path)
             crystal.calc = calc
             sf = FrechetCellFilter(crystal)
-            optimizer = BFGS(sf)
+            optimizer = optimizer_class(sf)
             optimizer.run(fmax=0.01, steps=3000)
             density = calculate_density(crystal)
             crystal.write(final_path)
@@ -164,6 +163,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Flag to use CPU only for calculations",
     )
+    parser.add_argument(
+        "--use_gpu_optimizer",
+        action="store_true",
+        help="Flag to use GPU optimizer for calculations",
+    )
     args = parser.parse_args()
     path, target_folder = resolve_target_folder(args.path, args.target_folder)
     n_jobs = args.n_jobs
@@ -181,6 +185,13 @@ if __name__ == "__main__":
     json_folder = os.path.join(path, "json_result")
     lock_folder = os.path.join(path, "lock")
     pid_file = os.path.join(lock_folder, "pid.txt")
+
+    if args.use_gpu_optimizer:
+        from bfgs_cuda import BFGSCuda
+        optimizer_class = BFGSCuda
+    else:
+        from ase.optimize import BFGS
+        optimizer_class = BFGS
 
     os.makedirs(press_folder, exist_ok=True)
     os.makedirs(final_folder, exist_ok=True)
