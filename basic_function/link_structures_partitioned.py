@@ -963,7 +963,7 @@ def assign_bond_types(atoms, bond_records):
     return bond_records
 
 
-def generate_bonds(atoms, cutoff_multi=1.05):
+def generate_bonds(atoms, cutoff_multi=1.1):
     cutoffs = natural_cutoffs(atoms, mult=cutoff_multi)
     # The neighbor list defines bonds; its reuse buffer would add false bonds.
     nl = build_neighbor_list(
@@ -1031,7 +1031,7 @@ def expand_cif_tags_to_labels(atoms: ase.Atoms):
     return atoms
 
 
-def append_bonds_to_cif(name, path, new_path, cutoff_multi=1.05, scale_factor=1.0):
+def append_bonds_to_cif(name, path, new_path, cutoff_multi=1.1, scale_factor=1.0):
     cif_path = os.path.join(path, name)
     new_cif_path = os.path.join(new_path, name)
     atoms = read(cif_path, store_tags=True)
@@ -1084,7 +1084,7 @@ def append_bonds_to_cif(name, path, new_path, cutoff_multi=1.05, scale_factor=1.
             )
 
 
-def deal_single_cif_file(cif, path, new_path, cutoff_multi=1.05, scale_factor=1.0):
+def deal_single_cif_file(cif, path, new_path, cutoff_multi=1.1, scale_factor=1.0):
     with open(os.devnull, "w") as devnull, redirect_stdout(devnull):
         try:
             append_bonds_to_cif(
@@ -1095,7 +1095,7 @@ def deal_single_cif_file(cif, path, new_path, cutoff_multi=1.05, scale_factor=1.
 
 
 def link_structures(
-    path, new_path, cutoff_multi=1.05, max_workers=None, scale_factor=1.0
+    path, new_path, cutoff_multi=1.1, max_workers=None, scale_factor=1.0
 ):
     os.makedirs(new_path, exist_ok=True)
     cif_list = [f for f in os.listdir(path) if f.endswith(".cif")]
