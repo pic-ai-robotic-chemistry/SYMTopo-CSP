@@ -89,7 +89,7 @@ if __name__ == "__main__":
             lammps_path,
             qeq_path,
             "--use-qeq",
-            "off",
+            "on",
             "--processes",
             str(workers),
         ]
