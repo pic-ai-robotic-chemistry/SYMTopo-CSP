@@ -38,6 +38,14 @@ out-of-plane atom crosses to the side of its two neighbours; FIRE follows the
 forces only and gets past it. The first attempt's outputs are kept with an
 .attempt1 suffix. If the retry itself fails, the first attempt is restored.
 
+QEq can diverge (charges in the thousands of e), for example when a collapsed
+angle brings a 1-3 pair to a few hundredths of an Angstrom: qeq/point does not
+exclude bonded pairs and uses an unshielded 1/r. The next minimize then sets
+PPPM up for those charges, needs a grid of tens of GB and effectively never
+finishes. Before every minimize and before write_data the input therefore
+compares the largest |q| with --qeq-max-charge and stops the job with a LAMMPS
+error when it is larger; the job is reported as failed.
+
 The script is intentionally conservative at the force-field level, but its
 default optimization recipe is tuned for coarse pre-DFT cleanup:
 - it does not try to rebuild Dreiding parameters itself
@@ -99,7 +107,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 from tqdm import tqdm
 
-SCRIPT_VERSION = "1.4.0"
+SCRIPT_VERSION = "1.5.0"
 RUNNING_MARKER = "relax.running"
 # Topology results that trigger the FIRE retry (see check_topology).
 RETRY_TOPOLOGIES = {"mismatch", "asymmetric"}
@@ -301,6 +309,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="Alpha parameter for qeq/slater",
     )
+    parser.add_argument(
+        "--qeq-max-charge",
+        type=float,
+        default=2.0,
+        help=(
+            "Fail a job whose largest |q| exceeds this value (e) before a minimize "
+            "or write_data, i.e. after QEq diverged (default: 2.0; 0 disables)"
+        ),
+    )
 
     parser.add_argument(
         "--kspace-style",
@@ -484,6 +501,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         parser.error("--dump-every must not be negative")
     if args.retry_fire_steps < 0:
         parser.error("--retry-fire-steps must not be negative")
+    if args.qeq_max_charge < 0:
+        parser.error("--qeq-max-charge must not be negative")
     return args
 
 
@@ -740,6 +759,24 @@ def build_box_relax_command(args: argparse.Namespace) -> Optional[str]:
     )
 
 
+def build_charge_guard(args: argparse.Namespace) -> str:
+    """Input line that stops the job when QEq has diverged; empty if disabled.
+
+    quit would end the worker process under --runner library (it calls exit).
+    Substituting an undefined variable raises an ordinary LAMMPS error instead:
+    the lmp binary exits with status 1 and the Python module raises an
+    exception.
+    """
+    if args.use_qeq != "on" or args.qeq_max_charge <= 0:
+        return ""
+    limit = f"{float(args.qeq_max_charge):.16g}"
+    return (
+        f'if "${{qmaxv}} > {limit}" then '
+        f'"print \'phase=qeq_guard_failed step=${{stepv}} qmax=${{qmaxv}} limit={limit}\' append {args.summary_name}" '
+        '"print ${QEq_charges_diverged}"\n'
+    )
+
+
 def build_optimize_input(
     args: argparse.Namespace,
     metadata: Dict[str, Any],
@@ -753,6 +790,7 @@ def build_optimize_input(
     use_qeq = args.use_qeq == "on"
     qeq_cmd = build_qeq_fix_command(args, qeq_file_name) if use_qeq else ""
     box_cmd = build_box_relax_command(args)
+    guard = build_charge_guard(args)
     traj_block = ""
     if args.dump_every > 0:
         traj_block = (
@@ -764,6 +802,7 @@ def build_optimize_input(
     stage1_lines = ""
     if args.pre_relax == "on":
         stage1_lines = (
+            f"{guard}"
             f"min_style {args.pre_min_style}\n"
             f"min_modify dmax {float(args.pre_dmax):.16g} line {args.pre_line}\n"
             f"minimize {float(args.pre_etol):.16g} {float(args.pre_ftol):.16g} {int(args.pre_maxiter)} {int(args.pre_maxeval)}\n"
@@ -772,6 +811,7 @@ def build_optimize_input(
         stage1_lines += (
             "# Topology retry: FIRE moves along the forces without a line search,\n"
             "# so it gets past the energy jumps the umbrella improper can produce.\n"
+            f"{guard}"
             "min_style fire\n"
             f"minimize 0.0 {float(args.pre_ftol):.16g} {int(fire_steps)} {10 * int(fire_steps)}\n"
         )
@@ -789,6 +829,7 @@ def build_optimize_input(
         for cycle in range(1, int(args.box_cycles) + 1):
             box_cycles_lines += (
                 f'print "phase=box_relax_start cycle={cycle}" append {summary}\n'
+                f"{guard}"
                 f"{box_cmd}\n"
                 "min_style cg\n"
                 f"min_modify dmax {float(args.box_dmax):.16g} line {args.box_line}\n"
@@ -839,6 +880,8 @@ thermo 50
 thermo_style custom step pe etotal press vol lx ly lz xy xz yz
 {traj_block}compute qcharge all property/atom q
 compute qsum all reduce sum c_qcharge
+variable absq atom abs(q)
+compute qmax all reduce max v_absq
 variable stepv equal step
 variable pev equal pe
 variable pressv equal press
@@ -850,13 +893,14 @@ variable xyv equal xy
 variable xzv equal xz
 variable yzv equal yz
 variable qsumv equal c_qsum
+variable qmaxv equal c_qmax
 
 shell rm -f {summary}
 print "phase=begin" append {summary}
 
 {qeq_block}{pre_block}# Stage 2: final optional atom + cell box relaxation.
 {box_cycles_lines}# Final state export.
-write_data {args.final_data_name}
+{guard}write_data {args.final_data_name}
 print "phase=final step=${{stepv}} pe=${{pev}} press=${{pressv}} vol=${{volv}} lx=${{lxv}} ly=${{lyv}} lz=${{lzv}} xy=${{xyv}} xz=${{xzv}} yz=${{yzv}} qsum=${{qsumv}}" append {summary}
 """
 
@@ -1347,6 +1391,13 @@ def _run_single_job(
             if ok
             else f"LAMMPS returned nonzero exit code: {returncode}"
         )
+        guard_event = summary_parsed.get("final", {})
+        if not ok and guard_event.get("phase") == "qeq_guard_failed":
+            message = (
+                f"QEq diverged: max |q| = {guard_event.get('qmax')} e at step "
+                f"{guard_event.get('step')} exceeds --qeq-max-charge "
+                f"{guard_event.get('limit')}; stopped before the next PPPM setup"
+            )
         if "topology" in retry:
             message += (
                 f"; FIRE retry after topology {retry['first_topology']}: {retry['topology']}"
@@ -1398,6 +1449,7 @@ def _run_single_job(
                     args.qeq_qstep if args.qeq_style in {"dynamic", "fire"} else None
                 ),
                 "alpha": args.slater_alpha if args.qeq_style == "slater" else None,
+                "max_charge": args.qeq_max_charge,
             },
             "relax_settings": {
                 "kspace_style": args.kspace_style,
