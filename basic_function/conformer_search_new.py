@@ -28,7 +28,9 @@ conformers from the most extended 20 % of the extension range
 (layer edges 80, layer quota 0 2, 3 global picks).
 
 ``write_label_template`` writes one quickly embedded structure whose atoms the
-user labels with ``x_site``/``y_site`` before running the search.
+user labels with ``x_site``/``y_site`` before running the search. Atoms
+labeled ``delete`` (e.g. hydrogens lost when the units link) are optimized with
+the molecule but left out of RMSD, shape descriptors and the written files.
 """
 
 import csv
@@ -110,6 +112,8 @@ DEFAULT_FF = "mmff94s"
 
 # File written by write_label_template and picked up by the search CLI.
 LABEL_TEMPLATE_NAME = "label_template.xyz"
+# Atoms with this label are left out of the written conformers.
+DELETE_LABEL = "delete"
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +272,8 @@ def write_label_template(source, out_path, charge=0, seed=-1, overwrite=False):
               f"label_template map-number=atom-line SMILES {mapped_smiles}")
     print(f"Wrote {target}.\n"
           "Add label=x_site and label=y_site (or typed a_x_site/a_y_site, ...) to the\n"
-          "connection atoms, then run the search again without --make_template.")
+          "connection atoms, and label=delete to atoms that leave on linking, then run\n"
+          "the search again without --make_template.")
     return target
 
 
@@ -287,6 +292,52 @@ def connection_pairs(labels):
                 f"Site type {kind or 'default'!r} needs exactly one x and one y site."
             )
     return {kind: (roles["x"], roles["y"]) for kind, roles in sorted(sites.items())}
+
+
+def drop_atoms(mol, indices):
+    """Copy of ``mol``, with all conformers, without the atoms in ``indices``.
+
+    Returns ``mol`` itself when ``indices`` is empty. Remaining atoms keep
+    their relative order.
+    """
+    if not indices:
+        return mol
+    rw = Chem.RWMol(mol)
+    for idx in sorted(indices, reverse=True):
+        rw.RemoveAtom(int(idx))
+    out = rw.GetMol()
+    out.UpdatePropertyCache(strict=False)
+    return out
+
+
+def deleted_atoms(mol, labels):
+    """Return the sorted indices of atoms labeled ``delete``.
+
+    These are atoms that leave when the units link (e.g. the H of a terminal
+    alkyne). A deleted atom may not also carry a site marker, and the atoms
+    left must form one connected molecule. Labels that are neither site
+    markers nor ``delete`` are kept as atom names, with a warning.
+    """
+    deleted, plain = [], []
+    for idx, label in sorted(labels.items()):
+        tokens = [token.lower() for token in str(label).split("__")]
+        if DELETE_LABEL in tokens:
+            if len(tokens) > 1:
+                raise ValueError(f"Atom line {idx + 1} ({label!r}): an atom labeled delete "
+                                 "cannot also be a connection site.")
+            deleted.append(idx)
+        elif not parse_site_label(label):
+            plain.append(f"{idx + 1}:{label}")
+    if plain:
+        print(f"Warning: labels {plain} (atom line:label) are neither connection sites nor "
+              "delete; they are kept as atom names.")
+    if deleted:
+        if len(deleted) == mol.GetNumAtoms():
+            raise ValueError("Every atom is labeled delete.")
+        if len(Chem.GetMolFrags(drop_atoms(mol, deleted))) > 1:
+            raise ValueError(f"Deleting atom lines {[i + 1 for i in deleted]} splits the "
+                             "molecule; only atoms at its periphery can be deleted.")
+    return deleted
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +412,16 @@ def heavy_atom_rmsd_matrix(mol, positions, mirror=False):
     """
     conformers = list(mol.GetConformers())
     heavy_idx = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
-    heavy = Chem.RemoveHs(mol)
+    # Remove every H explicitly; Chem.RemoveHs keeps some (e.g. lone or
+    # stereo-defining H), which would break the atom count of the copies.
+    heavy = drop_atoms(mol, [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 1])
+    heavy = Chem.Mol(heavy)
+    try:
+        Chem.SanitizeMol(heavy)
+    except Chem.rdchem.MolSanitizeException:
+        # Deleted atoms can leave a molecule that does not sanitize; the
+        # symmetry matching only needs elements, bonds and rings.
+        Chem.FastFindRings(heavy)
     heavy.RemoveAllConformers()
     copies = [False, True] if mirror else [False]
     for flip in copies:
@@ -654,12 +714,16 @@ def stratified_conformer_search(
         )
 
     mol, labels = load_molecule(source, template=template, charge=charge)
+    deleted = deleted_atoms(mol, labels)
     site_pairs = connection_pairs(labels)
     if template is not None and not site_pairs:
         raise ValueError(f"Template {template} has no x_site/y_site labels yet; label it first.")
     if not site_pairs:
         print("Warning: no connection-site labels; the written conformers must be labeled "
               "before structure generation (see --make_template).")
+    if deleted:
+        print(f"Atom lines {[i + 1 for i in deleted]} are labeled delete: they take part in "
+              "the force field but not in RMSD, shape descriptors or the written conformers.")
     if extension == "auto":
         extension = "sites" if site_pairs else "ends"
     if extension == "sites" and not site_pairs:
@@ -677,16 +741,24 @@ def stratified_conformer_search(
         raise RuntimeError("No conformer could be embedded.")
     print(f"Embedded {len(conf_ids)} conformers.")
 
-    shapes = ShapeDescriptors(mol, site_pairs)
-    ext_before = np.array([shapes.compute(mol, cid)[ext_key] for cid in conf_ids])
+    # Deleted atoms stay in ``mol`` for the force field; descriptors, RMSD and
+    # the written files use ``kept``, which has the same conformer order.
+    new_index = {old: new for new, old in
+                 enumerate(i for i in range(mol.GetNumAtoms()) if i not in deleted)}
+    kept_labels = {new_index[i]: label for i, label in labels.items() if i in new_index}
+    kept_sites = {kind: (new_index[x], new_index[y]) for kind, (x, y) in site_pairs.items()}
+    pre = drop_atoms(mol, deleted)
+    shapes = ShapeDescriptors(pre, kept_sites)
+    ext_before = np.array([shapes.compute(pre, cid)[ext_key] for cid in conf_ids])
     energies, converged, max_gradient = optimize(mol, ff, max_iters)
-    descriptors = [shapes.compute(mol, cid) for cid in conf_ids]
+    kept = drop_atoms(mol, deleted)
+    descriptors = [shapes.compute(kept, cid) for cid in conf_ids]
     ext = np.array([d[ext_key] for d in descriptors])
 
     mirror = is_achiral(mol) and not keep_mirror
     order = [int(p) for p in np.argsort(energies) if converged[p]]
     start = time.perf_counter()
-    rmsd = heavy_atom_rmsd_matrix(mol, order, mirror=mirror)
+    rmsd = heavy_atom_rmsd_matrix(kept, order, mirror=mirror)
     print(
         f"Heavy-atom RMSD matrix for {len(order)} conformers in "
         f"{time.perf_counter() - start:.1f} s; mirror images "
@@ -739,9 +811,9 @@ def stratified_conformer_search(
         layer = layer_of[pos]
         write_xyz(
             out_dir / f"{name}.xyz",
-            mol,
+            kept,
             conf_ids[pos],
-            labels,
+            kept_labels,
             f"{name} Energy = {energies[pos]:.4f} kcal/mol ({FF_LABELS[ff]} opt) "
             f"pick={'global' if pos in global_picks else 'layer'} layer={layer} "
             f"dE_layer={energies[pos] - layer_min[layer]:.4f} "
