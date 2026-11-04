@@ -103,6 +103,9 @@ if __name__ == "__main__":
             "--processes",
             str(workers),
             "--overwrite",
+            # Relaxed structures whose bonds differ from linked_structures go here.
+            "--bad-dir",
+            bad_path,
         ]
     )
     subprocess.run(
