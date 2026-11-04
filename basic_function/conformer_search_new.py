@@ -7,7 +7,8 @@ the crystal the extended forms are often competitive.
 1. embeds a large ETKDGv3 pool and optimizes it with MMFF94s (default),
    MMFF94 or UFF;
 2. removes duplicates by symmetry-aware heavy-atom RMSD (mirror images merged
-   for achiral molecules);
+   for achiral molecules; ``polar_h_rmsd`` also compares H on N/O/S, so COOH
+   flips and OH rotamers stay apart);
 3. splits the unique conformers into layers by an extension descriptor, with
    equal-width or equal-count layers, or with user-given boundaries as a
    percentage of the extension range or as percentiles of the pool;
@@ -401,20 +402,31 @@ def is_achiral(mol):
     )
 
 
-def heavy_atom_rmsd_matrix(mol, positions, mirror=False):
+def heavy_atom_rmsd_matrix(mol, positions, mirror=False, polar_h=False):
     """Symmetry-aware heavy-atom RMSD between the conformers at ``positions``.
 
-    Works on a hydrogen-free copy, so the output coordinates are never moved.
-    With ``mirror``, every conformer is also compared with the x-inverted
-    copies of the others and the smaller value is kept. Returns an
-    (n_conformers, n_conformers) matrix; rows/columns outside ``positions``
-    stay NaN. Memory and time grow as the square of len(positions).
+    Works on a copy without (non-polar) hydrogens, so the output coordinates
+    are never moved. With ``polar_h``, hydrogens on N, O and S are compared
+    too. RDKit treats two terminal O/N on one atom as interchangeable; without
+    those hydrogens this also swaps the C=O and OH oxygens of COOH (likewise
+    amidines, SO3H) and hides OH rotamers, while COO- and NO2 flips are true
+    symmetries either way. With ``mirror``, every conformer is also compared
+    with the x-inverted copies of the others and the smaller value is kept.
+    Returns an (n_conformers, n_conformers) matrix; rows/columns outside
+    ``positions`` stay NaN. Memory and time grow as the square of
+    len(positions).
     """
     conformers = list(mol.GetConformers())
-    heavy_idx = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
-    # Remove every H explicitly; Chem.RemoveHs keeps some (e.g. lone or
+
+    def compared(atom):
+        if atom.GetAtomicNum() > 1:
+            return True
+        return polar_h and any(n.GetAtomicNum() in (7, 8, 16) for n in atom.GetNeighbors())
+
+    heavy_idx = [a.GetIdx() for a in mol.GetAtoms() if compared(a)]
+    # Remove the other H explicitly; Chem.RemoveHs keeps some (e.g. lone or
     # stereo-defining H), which would break the atom count of the copies.
-    heavy = drop_atoms(mol, [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 1])
+    heavy = drop_atoms(mol, [a.GetIdx() for a in mol.GetAtoms() if not compared(a)])
     heavy = Chem.Mol(heavy)
     try:
         Chem.SanitizeMol(heavy)
@@ -696,6 +708,7 @@ def stratified_conformer_search(
     dedup_rmsd=0.3,
     cluster_rmsd=0.3,
     keep_mirror=False,
+    polar_h_rmsd=False,
     need_structure=None,
     layer_quota=None,
     n_global=DEFAULT_N_GLOBAL,
@@ -734,6 +747,9 @@ def stratified_conformer_search(
     params = AllChem.ETKDGv3()
     params.numThreads = 0
     params.pruneRmsThresh = rms_thresh
+    # Pruning compares heavy atoms only, where COOH looks symmetric; keep its
+    # flips and let the polar-H RMSD after optimization decide.
+    params.symmetrizeConjugatedTerminalGroupsForPruning = not polar_h_rmsd
     params.useRandomCoords = with_random
     params.randomSeed = seed
     conf_ids = list(AllChem.EmbedMultipleConfs(mol, numConfs=num_conformers, params=params))
@@ -758,9 +774,10 @@ def stratified_conformer_search(
     mirror = is_achiral(mol) and not keep_mirror
     order = [int(p) for p in np.argsort(energies) if converged[p]]
     start = time.perf_counter()
-    rmsd = heavy_atom_rmsd_matrix(kept, order, mirror=mirror)
+    rmsd = heavy_atom_rmsd_matrix(kept, order, mirror=mirror, polar_h=polar_h_rmsd)
     print(
-        f"Heavy-atom RMSD matrix for {len(order)} conformers in "
+        f"{'Heavy-atom + polar-H' if polar_h_rmsd else 'Heavy-atom'} RMSD matrix for "
+        f"{len(order)} conformers in "
         f"{time.perf_counter() - start:.1f} s; mirror images "
         f"{'merged' if mirror else 'kept apart'}."
     )

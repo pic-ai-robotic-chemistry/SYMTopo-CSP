@@ -72,6 +72,11 @@ def main():
                         help="Minimum heavy-atom RMSD (A) between any two picks, across layers")
     parser.add_argument("--keep_mirror", action="store_true",
                         help="Treat mirror-image conformers as different")
+    parser.add_argument("--polar_h_rmsd", action="store_true",
+                        help="Also compare H on N/O/S in the RMSD, and do not symmetrize terminal "
+                             "groups when pruning embeddings, so COOH (amidine, SO3H) flips and "
+                             "OH rotamers count as different conformers; COO- and NO2 flips "
+                             "still merge")
     parser.add_argument("--n_global", type=int, default=DEFAULT_N_GLOBAL,
                         help="Lowest-energy conformers of the whole pool to pick before the "
                              f"layers (default {DEFAULT_N_GLOBAL})")
@@ -134,6 +139,7 @@ def main():
         dedup_rmsd=args.dedup_rmsd,
         cluster_rmsd=args.cluster_rmsd,
         keep_mirror=args.keep_mirror,
+        polar_h_rmsd=args.polar_h_rmsd,
         need_structure=args.need_structure,
         layer_quota=args.layer_quota,
         n_global=args.n_global,
