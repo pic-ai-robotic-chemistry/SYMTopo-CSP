@@ -9,7 +9,7 @@ This repository, and especially `all_processes.py`, should be treated as a refer
 ## Workflow
 
 1. Generate fragment conformers with RDKit ETKDGv3.
-2. Select one conformer and label the two polymerization sites as `x_site` and `y_site`.
+2. Label polymerization sites as `x_site` and `y_site`, using types and member IDs when multiple connections are needed.
 3. Pack the fragment in selected space groups using Sobol quasi-random sampling.
 4. Reconstruct periodic covalent links while rejecting finite cyclic assignments.
 5. Regularize the linked structures with Dreiding in LAMMPS.
@@ -75,7 +75,23 @@ C    0.00000000    0.00000000    0.00000000    label=x_site
 C    1.40000000    0.00000000    0.00000000    label=y_site
 ```
 
-Each molecular component must contain exactly one `x_site` and one `y_site`. The topology reconstruction code uses these labels to find a minimum-cost periodic assignment and excludes assignments that form finite molecular cycles.
+For multiple connection types, use labels such as `a_x_site_bo2` / `a_y_site_bo2` and `b_x_site_bo1` / `b_y_site_bo1`. The suffix `_bo1`, `_bo2`, or `_bo3` specifies the integer bond order; omitting it means a single bond. New bonds can subsequently be identified as aromatic. One atom may carry several different markers separated by `__`, for example `label=a_x_site_bo2__b_y_site_bo1`.
+
+Equivalent members of the same type use explicit positive member IDs, placed **after `_site` and before `_boN`**:
+
+| Connection sites | Labels on separate atoms |
+| --- | --- |
+| Two equivalent a-type x sites | `a_x_site_id1_bo1`, `a_x_site_id2_bo1` |
+| Two equivalent a-type y sites | `a_y_site_id1_bo1`, `a_y_site_id2_bo1` |
+| One fixed b-type pair | `b_x_site_bo2`, `b_y_site_bo2` |
+
+The type defines which sites can connect. **Member IDs identify atoms, not prescribed pairs:** either a-type x site can connect to either a-type y site. The linker chooses a one-to-one matching that minimizes the sum of squared connection distances. Default-type labels such as `x_site_id1` and `y_site_id2` are also supported.
+
+Every participating molecular component must have the same types and member counts, with equal nonzero x/y counts within each type. Different types may have different counts. A group with multiple members requires IDs on every member, unique within each component, type and direction; two identical unnumbered `x_site` labels are not sufficient. IDs need not match between x and y. Each type must specify the same bond order throughout the structure. Different types can share an atom, and an atom can carry both x and y markers; repeating the same type and direction on one atom is invalid. Duplicate physical bonds, including reverse periodic duplicates, are errors rather than merged bonds.
+
+All connections from one fragment share one target fragment and one periodic image. The fragment distance matrix contains the sum of the optimal matching costs for all types, with every connection weighted equally. The existing topology solver excludes assignments that form finite molecular cycles. Automatic symmetry, supercell and numeric copy suffixes are preserved and are distinct from `_idN`; `__` remains reserved for separating markers.
+
+The labeled XYZ/template workflow in `conformer_search.py` accepts the same syntax. In each conformer, equivalent members are matched by the minimum sum of squared distances. The `d_<type>` descriptor is the arithmetic mean of the selected distances, and `d_xy` averages these type descriptors equally. Single-member groups retain their previous descriptor values. Labels survive template mapping, removal of `delete` atoms and XYZ/CIF output.
 
 ## Run the staged workflow
 

@@ -19,8 +19,10 @@ the crystal the extended forms are often competitive.
    ``cluster_rmsd`` heavy-atom RMSD from all earlier picks, in any layer;
 6. writes labeled XYZ files, a summary CSV and an energy-extension plot.
 
-The default extension descriptor is the mean intramolecular x_site-y_site
-distance, which is the quantity that sets the chain repeat. Site labels come
+The default extension descriptor averages intramolecular x_site-y_site
+distances within each type, then averages types equally. Equivalent members
+(e.g. a_x_site_id1, a_x_site_id2) are matched to minimize the sum of squared
+distances in each conformer; IDs do not prescribe pairs. Site labels come
 from a labeled XYZ input or from a labeled template; without labels the
 distance between the topologically most distant heavy atoms is used.
 
@@ -47,7 +49,11 @@ from rdkit.Chem import rdMolDescriptors
 from rdkit.Geometry import Point3D
 
 from basic_function import format_parser
-from basic_function.link_structures_partitioned import parse_site_label
+from basic_function.link_structures_partitioned import (
+    collect_site_groups,
+    match_equivalent_sites,
+    parse_site_label,
+)
 
 
 def _load_mol_from_smiles_or_pdb(smiles_or_path: str) -> Any:
@@ -273,26 +279,16 @@ def write_label_template(source, out_path, charge=0, seed=-1, overwrite=False):
               f"label_template map-number=atom-line SMILES {mapped_smiles}")
     print(f"Wrote {target}.\n"
           "Add label=x_site and label=y_site (or typed a_x_site/a_y_site, ...) to the\n"
-          "connection atoms, and label=delete to atoms that leave on linking, then run\n"
+          "connection atoms; use _id1, _id2, ... for equivalent members of a type.\n"
+          "Add label=delete to atoms that leave on linking, then run\n"
           "the search again without --make_template.")
     return target
 
 
 def connection_pairs(labels):
-    """Return {site_type: (x_index, y_index)} from ``*_x_site``/``*_y_site``."""
-    sites = {}
-    for idx, label in labels.items():
-        for kind, role, _ in parse_site_label(label):
-            roles = sites.setdefault(kind, {})
-            if role in roles:
-                raise ValueError(f"Site type {kind or 'default'!r} has two {role} sites.")
-            roles[role] = idx
-    for kind, roles in sites.items():
-        if set(roles) != {"x", "y"}:
-            raise ValueError(
-                f"Site type {kind or 'default'!r} needs exactly one x and one y site."
-            )
-    return {kind: (roles["x"], roles["y"]) for kind, roles in sorted(sites.items())}
+    """Return {site_type: (x_indices, y_indices)}; pairs are chosen per conformer."""
+    groups = collect_site_groups(labels, context="Conformer sites")
+    return {kind: (group["x"], group["y"]) for kind, group in groups.items()}
 
 
 def drop_atoms(mol, indices):
@@ -350,7 +346,11 @@ class ShapeDescriptors:
     """Per-conformer shape descriptors that do not depend on the force field."""
 
     def __init__(self, mol, site_pairs):
-        self.site_pairs = site_pairs
+        # Accept legacy scalar pairs as well as groups of equivalent members.
+        self.site_pairs = {
+            kind: (np.atleast_1d(x).astype(int), np.atleast_1d(y).astype(int))
+            for kind, (x, y) in site_pairs.items()
+        }
         self.heavy = np.array([a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1])
         topo = Chem.GetDistanceMatrix(mol)[np.ix_(self.heavy, self.heavy)]
         iu = np.triu_indices(len(self.heavy), k=1)
@@ -365,7 +365,8 @@ class ShapeDescriptors:
         xyz = conf.GetPositions()
         out = {}
         for kind, (x_idx, y_idx) in self.site_pairs.items():
-            out[f"d_{kind or 'site'}"] = float(np.linalg.norm(xyz[x_idx] - xyz[y_idx]))
+            _, squared = match_equivalent_sites(xyz[x_idx], xyz[y_idx])
+            out[f"d_{kind or 'site'}"] = float(np.sqrt(squared).mean())
         if self.site_pairs:
             out["d_xy"] = float(np.mean([out[f"d_{k or 'site'}"] for k in self.site_pairs]))
         out["d_ends"] = _mean_pair_distance(xyz, self.end_pairs)
@@ -762,7 +763,8 @@ def stratified_conformer_search(
     new_index = {old: new for new, old in
                  enumerate(i for i in range(mol.GetNumAtoms()) if i not in deleted)}
     kept_labels = {new_index[i]: label for i, label in labels.items() if i in new_index}
-    kept_sites = {kind: (new_index[x], new_index[y]) for kind, (x, y) in site_pairs.items()}
+    # Recollect all members from remapped labels, including shared-site atoms.
+    kept_sites = connection_pairs(kept_labels)
     pre = drop_atoms(mol, deleted)
     shapes = ShapeDescriptors(pre, kept_sites)
     ext_before = np.array([shapes.compute(pre, cid)[ext_key] for cid in conf_ids])

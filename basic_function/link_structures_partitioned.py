@@ -8,8 +8,12 @@ as the marker separator; type names use letters, digits and single underscores.
 Automatic symmetry, supercell and numeric copy suffixes apply to the whole
 label. A hyphen before x/y is also accepted, matching upstream normalization.
 
-Every participating fragment must have the same types and exactly one x and y
-per type, although these may share atoms. Orders must agree within each type.
+Equivalent members of a type use positive IDs, e.g. ``a_x_site_id1_bo2`` and
+``a_x_site_id2_bo2``. IDs distinguish members; they do not prescribe x/y pairs.
+Every participating fragment must have the same types and member counts, with
+equal numbers of x and y per type. Multi-member groups require explicit IDs,
+unique within each direction. Different types may share atoms, as may x and y.
+Orders must agree within each type.
 All types share one target fragment image. Duplicate physical bonds are errors.
 Declared orders are fixed during integer-order inference, but may subsequently
 be written as aromatic (A) after RDKit perception in an open three-period graph.
@@ -95,7 +99,7 @@ CCDC_TYPE_FROM_ORDER = {1: "S", 2: "D", 3: "T"}
 
 SITE_MARKER_RE = re.compile(
     r"(?:(?P<kind>[A-Za-z][A-Za-z0-9_]*?)[_-])?"
-    r"(?P<role>[xy])_site(?:_bo(?P<order>[123]))?"
+    r"(?P<role>[xy])_site(?:_id(?P<member>[0-9]+))?(?:_bo(?P<order>[123]))?"
 )
 # Negative supercell indices become double underscores during normalization.
 SITE_COPY_SUFFIX_RE = re.compile(
@@ -105,6 +109,11 @@ SITE_COPY_SUFFIX_RE = re.compile(
 
 def parse_site_label(label):
     """Return all (type, role, order) markers, ignoring ordinary atom labels."""
+    return [(kind, role, order) for kind, role, order, _ in _parse_site_markers(label)]
+
+
+def _parse_site_markers(label):
+    """Detailed parser; member IDs are separate from automatic copy suffixes."""
     if not isinstance(label, str) or "_site" not in label:
         return []
     base = SITE_COPY_SUFFIX_RE.sub("", label)
@@ -115,7 +124,7 @@ def parse_site_label(label):
         if match is None:
             raise ValueError(
                 f"Invalid connection label {label!r}: expected "
-                "[type_]x_site[_bo1/2/3] or [type_]y_site[_bo1/2/3], "
+                "[type_]x_site[_idN][_bo1/2/3] or [type_]y_site[_idN][_bo1/2/3], "
                 "separated by '__'."
             )
         kind = match.group("kind") or ""
@@ -123,8 +132,71 @@ def parse_site_label(label):
         if (kind, role) in seen:
             raise ValueError(f"Repeated {kind or 'default'}-{role} marker in {label!r}.")
         seen.add((kind, role))
-        markers.append((kind, role, int(match.group("order") or 1)))
+        member = match.group("member")
+        member = int(member) if member is not None else None
+        if member == 0:
+            raise ValueError(f"Member ID must be a positive integer in {label!r}.")
+        markers.append((kind, role, int(match.group("order") or 1), member))
     return markers
+
+
+def collect_site_groups(labels, context="Fragment"):
+    """Validate one fragment's {atom_index: label} and return typed site lists.
+
+    Each group contains ``x`` and ``y`` tuples of atom indices, ordered by
+    member ID (then atom index), and a shared integer ``order``. The tuples
+    describe interchangeable members, not fixed pairs at corresponding slots.
+    """
+    groups = {}
+    for idx, label in sorted(labels.items()):
+        for kind, role, order, member in _parse_site_markers(label):
+            group = groups.setdefault(kind, {"x": [], "y": [], "order": order})
+            if order != group["order"]:
+                raise ValueError(
+                    f"{context}: conflicting bond orders for type {kind or 'default'!r} "
+                    f"at atom {idx} ({label!r}): {group['order']} and {order}."
+                )
+            group[role].append((member, idx))
+
+    for kind, group in groups.items():
+        nx, ny = len(group["x"]), len(group["y"])
+        prefix = f"{context}, type {kind or 'default'!r}"
+        if not nx or nx != ny:
+            raise ValueError(f"{prefix} needs equal nonzero x/y counts; got {nx} x and {ny} y.")
+        for role in ("x", "y"):
+            members = group[role]
+            if len(members) > 1 and any(member is None for member, _ in members):
+                raise ValueError(
+                    f"{prefix} has multiple {role} sites; every member needs an explicit "
+                    f"_idN: {[(idx, labels[idx]) for _, idx in members]!r}."
+                )
+            seen = {}
+            for member, idx in members:
+                if member in seen:
+                    previous = seen[member]
+                    raise ValueError(
+                        f"{prefix} has duplicate {role} member ID {member}: "
+                        f"atoms {previous} ({labels[previous]!r}) and {idx} ({labels[idx]!r})."
+                    )
+                seen[member] = idx
+            group[role] = tuple(idx for _, idx in sorted(
+                members, key=lambda item: (item[0] or 0, item[1])
+            ))
+    return {kind: groups[kind] for kind in sorted(groups)}
+
+
+def match_equivalent_sites(x_positions, y_positions, translation=0):
+    """Return target columns and matched squared distances in x-member order.
+
+    Both position arrays have the same (n, 3) shape. A single translation is
+    applied to the entire target fragment; do not take per-pair minimum images.
+    """
+    vectors = y_positions[np.newaxis, :, :] - x_positions[:, np.newaxis, :] + translation
+    squared = np.sum(vectors**2, axis=-1)
+    if len(x_positions) == 1:
+        return np.array([0], dtype=int), squared[0]
+    rows, columns = linear_sum_assignment(squared)
+    return columns, squared[rows, columns]
 
 
 def get_cycles(assignment):
@@ -315,31 +387,28 @@ def find_and_link_sites(atoms: ase.Atoms, nl: NeighborList):
 
     matrix = nl.get_connectivity_matrix(sparse=True).tocsr()
     _, component_list = sparse.csgraph.connected_components(matrix)
-    fragments = {}
-    orders = {}
+    fragment_labels = {}
     for idx, label in enumerate(labels):
-        for kind, role, order in parse_site_label(label):
-            component = int(component_list[idx])
-            sites = fragments.setdefault(component, {}).setdefault(kind, {})
-            if role in sites:
-                previous = sites[role]
-                raise ValueError(
-                    f"Fragment {component} has duplicate {kind or 'default'}-{role} "
-                    f"sites: atoms {previous} ({labels[previous]!r}) and {idx} ({label!r})."
-                )
-            if kind in orders and orders[kind] != order:
-                raise ValueError(
-                    f"Conflicting bond orders for type {kind or 'default'!r}: "
-                    f"{orders[kind]} and {order} at atom {idx} ({label!r})."
-                )
-            orders[kind] = order
-            sites[role] = idx
+        fragment_labels.setdefault(int(component_list[idx]), {})[idx] = label
+    fragments = {}
+    for component, members in fragment_labels.items():
+        groups = collect_site_groups(members, context=f"Fragment {component}")
+        if groups:
+            fragments[component] = groups
 
     if not fragments:
         return None
 
     component_ids = sorted(fragments)
-    kinds = sorted(orders)
+    reference = fragments[component_ids[0]]
+    kinds = list(reference)
+    orders = {kind: reference[kind]["order"] for kind in kinds}
+    group_slices = {}
+    total_sites = 0
+    for kind in kinds:
+        count = len(reference[kind]["x"])
+        group_slices[kind] = slice(total_sites, total_sites + count)
+        total_sites += count
     x_indices = []
     y_indices = []
     for component in component_ids:
@@ -350,13 +419,19 @@ def find_and_link_sites(atoms: ase.Atoms, nl: NeighborList):
                 f"expected {kinds!r}."
             )
         for kind in kinds:
-            if set(sites[kind]) != {"x", "y"}:
+            if len(sites[kind]["x"]) != len(reference[kind]["x"]):
                 raise ValueError(
                     f"Fragment {component}, type {kind or 'default'!r} "
-                    "must contain exactly one x site and one y site."
+                    f"has {len(sites[kind]['x'])} members per direction; "
+                    f"expected {len(reference[kind]['x'])}."
                 )
-        x_indices.append([sites[kind]["x"] for kind in kinds])
-        y_indices.append([sites[kind]["y"] for kind in kinds])
+            if sites[kind]["order"] != orders[kind]:
+                raise ValueError(
+                    f"Fragment {component}, type {kind or 'default'!r} has conflicting "
+                    f"bond order {sites[kind]['order']}; expected {orders[kind]}."
+                )
+        x_indices.append([idx for kind in kinds for idx in sites[kind]["x"]])
+        y_indices.append([idx for kind in kinds for idx in sites[kind]["y"]])
 
     x_indices = np.asarray(x_indices, dtype=int)
     y_indices = np.asarray(y_indices, dtype=int)
@@ -382,11 +457,14 @@ def find_and_link_sites(atoms: ase.Atoms, nl: NeighborList):
         y_offsets[i] = [offsets[int(idx)] for idx in y_indices[i]]
     x_positions = atoms.positions[x_indices] + x_offsets @ cell
     y_positions = atoms.positions[y_indices] + y_offsets @ cell
+    # Average all members, not group centers: every proposed bond has equal weight.
     x_centers = x_positions.mean(axis=1)
     y_centers = y_positions.mean(axis=1)
 
     # Sum_t |d_t + shift|^2 = count * |mean(d_t) + shift|^2 + constant.
     # Thus the centroid MIC minimizes all bond lengths for ONE fragment image.
+    # Permuting targets within a group leaves mean(d_t) unchanged, so the
+    # optimal fragment translation is independent of the member matching.
     center_vecs, _ = get_distances(x_centers, y_centers, cell=cell, pbc=pbc)
     center_raw = y_centers[np.newaxis, :, :] - x_centers[:, np.newaxis, :]
     fragment_offsets = np.rint((center_vecs - center_raw) @ inv_cell).astype(int)
@@ -406,13 +484,28 @@ def find_and_link_sites(atoms: ase.Atoms, nl: NeighborList):
 
     x2y_dist_sqr = np.zeros((eff_components, eff_components), dtype=float)
     translations = fragment_offsets @ cell
-    for t in range(len(kinds)):
-        vectors = (
-            y_positions[np.newaxis, :, t, :]
-            - x_positions[:, np.newaxis, t, :]
-            + translations
-        )
-        x2y_dist_sqr += np.sum(vectors**2, axis=-1)
+    pairings = np.empty((eff_components, eff_components, total_sites), dtype=int)
+    for kind in kinds:
+        span = group_slices[kind]
+        if span.stop - span.start == 1:
+            t = span.start
+            vectors = (
+                y_positions[np.newaxis, :, t, :]
+                - x_positions[:, np.newaxis, t, :]
+                + translations
+            )
+            x2y_dist_sqr += np.sum(vectors**2, axis=-1)
+            pairings[:, :, t] = t
+            continue
+        for i in range(eff_components):
+            for j in range(eff_components):
+                columns, squared = match_equivalent_sites(
+                    x_positions[i, span], y_positions[j, span], translations[i, j]
+                )
+                x2y_dist_sqr[i, j] += squared.sum()
+                pairings[i, j, span] = span.start + columns
+
+    # These are reference offsets for fragment winding, not mandatory site pairs.
     y2x_offsets = x_offsets[:, 0, :]
     x2y_offsets = fragment_offsets - y2x_offsets[:, np.newaxis, :]
     cost, assignment = solve_minimal_path(x2y_dist_sqr, y2x_offsets, x2y_offsets)
@@ -422,19 +515,22 @@ def find_and_link_sites(atoms: ase.Atoms, nl: NeighborList):
 
     new_links = []
     for i, j in enumerate(assignment):
-        for t, kind in enumerate(kinds):
-            offset = fragment_offsets[i, j] + y_offsets[j, t] - x_offsets[i, t]
-            new_links.append(
-                {
-                    "idx1": int(x_indices[i, t]),
-                    "idx2": int(y_indices[j, t]),
-                    "offset": tuple(int(value) for value in offset),
-                    "site_type": kind,
-                    "fixed_order": orders[kind],
-                    "source_component": component_ids[i],
-                    "target_component": component_ids[j],
-                }
-            )
+        for kind in kinds:
+            span = group_slices[kind]
+            for t in range(span.start, span.stop):
+                target = pairings[i, j, t]
+                offset = fragment_offsets[i, j] + y_offsets[j, target] - x_offsets[i, t]
+                new_links.append(
+                    {
+                        "idx1": int(x_indices[i, t]),
+                        "idx2": int(y_indices[j, target]),
+                        "offset": tuple(int(value) for value in offset),
+                        "site_type": kind,
+                        "fixed_order": orders[kind],
+                        "source_component": component_ids[i],
+                        "target_component": component_ids[j],
+                    }
+                )
 
     validate_unique_bonds(atoms, new_links)
     return matrix, new_links
